@@ -1,0 +1,2528 @@
+---
+title: "Metagenomic surveillance unveils environmental dysbiosis and enriched resistome of human-impacted surface waters in central Mexico"
+subtitle: "Reproducible Bioinformatics and Statistical Workflow"
+author: "GENVET Laboratory"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+    html_preview: true
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.path = "figures/",
+  fig.width = 13,
+  fig.height = 13,
+  dpi = 300
+)
+```
+
+---
+
+### Module 1. Environment Setup and Target Taxa Definition
+
+```{r 01-libraries-and-taxa}
+# ------------------------------------------------------------------------------
+# Data Management & Graphical Rendering
+# ------------------------------------------------------------------------------
+library(readxl)
+library(tidyverse) # Includes dplyr, tidyr, tibble, stringr, ggplot2
+library(ggplot2)
+library(dplyr)
+library(ggtext)
+library(patchwork)
+library(ggpubr)
+library(Hmisc)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(ggh4x)
+library(vegan)
+library(openxlsx)
+library(readr)
+library(svglite)
+library(ggrepel)
+
+# ------------------------------------------------------------------------------
+# Taxonomic Tree & Data Management
+# ------------------------------------------------------------------------------
+library(taxize)
+library(ape)
+
+# ------------------------------------------------------------------------------
+# Network Topology Computation & Rendering
+# ------------------------------------------------------------------------------
+library(igraph)
+library(tidygraph)
+library(ggraph)
+
+# ------------------------------------------------------------------------------
+# Rendering Tables
+# ------------------------------------------------------------------------------
+library(knitr)
+library(kableExtra)
+
+# ------------------------------------------------------------------------------
+# Target Species Panels
+# ------------------------------------------------------------------------------
+
+# ESKAPE Pathogens
+focal_eskape_species <- c(
+  "Acinetobacter baumannii", "Enterobacter cloacae", "Enterobacter hormaechei",
+  "Klebsiella pneumoniae", "Pseudomonas aeruginosa"
+)
+
+# Opportunistic Pathogens
+focal_opportunistic_species <- c(
+  "Acinetobacter johnsonii", "Acinetobacter lwoffii", "Klebsiella oxytoca", "Pseudomonas putida",
+  "Aeromonas media", "Aeromonas caviae", "Aeromonas veronii", 
+  "Aliarcobacter cryaerophilus", "Aliarcobacter butzleri",
+  "Escherichia coli", "Escherichia albertii", "Escherichia fergusonii",
+  "Mycobacterium tuberculosis", "Mycobacterium intracellulare", "Mycobacterium avium"
+)
+
+# Consolidated 20 Clinical Pathogens Panel
+focal_20_clinical <- c(focal_eskape_species, focal_opportunistic_species)
+
+# Native Aquatic Genera
+native_target_genera <- c(
+  "Microcystis", "Fluviibacter", "Acidovorax", "Cyanobium", "Rheinheimera", 
+  "Thauera", "Polynucleobacter", "Synechococcus", "Streptomyces", "Flavobacterium", "Massilia"
+)
+
+# Core Environmental Genera
+core_target_genera <- c("Faucicola", "Tolumonas", "Bifidobacterium")
+```
+
+---
+
+### Module 2. Load Taxonomy Data and Filter Target Species
+```{r 02-load-taxonomy}
+# Load raw taxonomy table
+tax_data_raw <- read_excel("Taxonomy.xlsx")
+
+# Standardize species-level records
+tax_species_all <- tax_data_raw %>%
+  filter(Taxonomic_level == "Species" | Taxonomic_level == "species" | is.na(Taxonomic_level)) %>%
+  mutate(
+    Taxa = str_trim(Taxa),
+    Sample_name = str_trim(Sample_name),
+    Relative_abundance = as.numeric(Relative_abundance),
+    Genus = str_extract(Taxa, "^[A-Za-z]+")
+  )
+
+# Abundance threshold
+abundance_cutoff <- 0.1
+
+# Filter native aquatic species (top representative per target genus >= 0.1%)
+filtered_native_species <- tax_species_all %>%
+  filter(Genus %in% native_target_genera) %>%
+  group_by(Genus, Taxa) %>%
+  summarise(Mean_Abundance = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Genus) %>%
+  slice_max(order_by = Mean_Abundance, n = 1, with_ties = FALSE) %>%
+  filter(Mean_Abundance >= abundance_cutoff) %>%
+  pull(Taxa)
+
+# Filter core environmental species (top representative per target genus >= 0.1%)
+filtered_core_species <- tax_species_all %>%
+  filter(Genus %in% core_target_genera) %>%
+  group_by(Genus, Taxa) %>%
+  summarise(Mean_Abundance = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Genus) %>%
+  slice_max(order_by = Mean_Abundance, n = 1, with_ties = FALSE) %>%
+  filter(Mean_Abundance >= abundance_cutoff) %>%
+  pull(Taxa)
+
+# Consolidated master target species list
+target_species_list <- unique(c(focal_20_clinical, filtered_native_species, filtered_core_species))
+
+# Pivot taxonomy to wide format matrix (samples x species)
+tax_filtered <- tax_species_all %>%
+  filter(Taxa %in% target_species_list) %>%
+  mutate(
+    sample_prefix = str_extract(Sample_name, "^[A-Za-z]+"),
+    sample_num    = as.numeric(str_extract(Sample_name, "[0-9]+")),
+    sample        = paste0(sample_prefix, sample_num)
+  ) %>%
+  group_by(sample, Taxa) %>%
+  summarise(Abundance = sum(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Taxa, values_from = Abundance, values_fill = 0)
+```
+
+---
+
+### Module 3. Load Resistome Data and Build Combined Matrices
+```{r 03-load-arg-and-merge}
+# Load raw ARG table
+arg_data_raw <- read_excel("Resistome.xlsx")
+
+# Standardize ARG genes and sample identifiers
+arg_data <- arg_data_raw %>%
+  mutate(
+    Sample_name = str_trim(Sample_name),
+    ARG_Gene    = str_trim(gene_unif_final_manual),
+    RPKG        = as.numeric(RPKG)
+  ) %>%
+  mutate(
+    sample_prefix = str_extract(Sample_name, "^[A-Za-z]+"),
+    sample_num    = as.numeric(str_extract(Sample_name, "[0-9]+")),
+    sample        = paste0(sample_prefix, sample_num)
+  ) %>%
+  group_by(sample, ARG_Gene) %>%
+  summarise(RPKG = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = ARG_Gene, values_from = RPKG, values_fill = 0)
+
+# Merge taxonomy and ARG datasets by sample
+combined_data <- inner_join(tax_filtered, arg_data, by = "sample") %>%
+  column_to_rownames("sample")
+
+# Identify column subsets
+taxa_cols <- intersect(names(combined_data), target_species_list)
+arg_cols  <- setdiff(names(combined_data), taxa_cols)
+
+# Extract pure numerical matrices
+taxa_matrix <- as.matrix(combined_data[, taxa_cols])
+arg_matrix  <- as.matrix(combined_data[, arg_cols])
+```
+
+---
+
+### Module 4. Metagenomic Taxonomic Profiling, Abundance Dynamics, and Microbial Co-occurrence Networks
+
+This section processes `Taxonomy.xlsx` to generate the iTOL phylogenetic tree annotation files (Panel A) and builds the comparative abundance boxplots (Panel B) alongside the circular Spearman microbial co-occurrence network (Panel C).
+
+#### 4.1 Panel A: Taxonomic Tree Generation & iTOL Annotation Export
+
+```{r 04a-figure2-panel-a-itol}
+# ------------------------------------------------------------------------------
+# 1. CALCULATE TOP 100 SPECIES ABUNDANCE COVERAGE METRICS
+# ------------------------------------------------------------------------------
+data_rel_taxa <- read_excel("Taxonomy.xlsx")
+
+non_bacterial_taxa <- c("Chordata", "Ascomycota", "Bacillariophyta", "Uroviricota", 
+                        "Streptophyta", "Arthropoda", "Eukaryota", "Viruses", "Mammalia")
+
+species_data <- data_rel_taxa %>%
+  filter(!Taxa %in% non_bacterial_taxa) %>%
+  filter(Taxonomic_level == "Species" | Taxonomic_level == "species" | is.na(Taxonomic_level)) %>%
+  mutate(
+    Relative_abundance = as.numeric(Relative_abundance),
+    Taxa = str_trim(Taxa)
+  )
+
+species_summary <- species_data %>%
+  group_by(Taxa) %>%
+  summarise(Mean_Abundance = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Mean_Abundance))
+
+top_species_100 <- species_summary %>% slice_head(n = 100)
+
+total_species_abundance <- sum(species_summary$Mean_Abundance)
+top100_abundance        <- sum(top_species_100$Mean_Abundance)
+percentage_covered_100  <- (top100_abundance / total_species_abundance) * 100
+
+sample_coverage_100 <- species_data %>%
+  filter(Taxa %in% top_species_100$Taxa) %>%
+  group_by(Sample_name) %>%
+  summarise(Top100_Sample_Sum = sum(Relative_abundance, na.rm = TRUE), .groups = "drop")
+
+mean_cov_100 <- mean(sample_coverage_100$Top100_Sample_Sum) 
+sd_cov_100   <- sd(sample_coverage_100$Top100_Sample_Sum)
+min_cov_100  <- min(sample_coverage_100$Top100_Sample_Sum) 
+max_cov_100  <- max(sample_coverage_100$Top100_Sample_Sum)
+
+cat("\n=================== TOP 100 SPECIES METRICS ===================\n")
+cat(sprintf("-> Total abundance covered (Top 100): %.2f%%\n", percentage_covered_100))
+cat(sprintf("-> Mean sample coverage: %.2f%% ± %.2f%% (Range: %.2f%% - %.2f%%)\n",
+            mean_cov_100, sd_cov_100, min_cov_100, max_cov_100))
+cat("================================================================\n\n")
+
+# ------------------------------------------------------------------------------
+# 2. RETRIEVE NCBI TAXONOMY & BUILD LINEAGE MATRIX
+# ------------------------------------------------------------------------------
+cat("-> Fetching NCBI taxonomy for Top 100 species...\n")
+tax_hierarchy_100 <- classification(top_species_100$Taxa, db = "ncbi")
+
+extract_ranks <- function(class_res, species_name) {
+  if (is.na(class_res)[1]) return(NULL)
+  ranks <- c("phylum", "class", "order", "family", "genus", "species")
+  sub_df <- class_res %>% filter(rank %in% ranks)
+  res <- setNames(rep(NA, length(ranks)), ranks)
+  res[sub_df$rank] <- sub_df$name
+  res["species"] <- species_name
+  return(as.list(res))
+}
+
+lineage_list_100 <- lapply(names(tax_hierarchy_100), function(sp) {
+  extract_ranks(tax_hierarchy_100[[sp]], sp)
+})
+
+lineage_df_100 <- bind_rows(lineage_list_100) %>% na.omit()
+colnames(lineage_df_100) <- c("Phylum", "Class", "Order", "Family", "Genus", "Species")
+matched_top_100 <- top_species_100 %>% filter(Taxa %in% lineage_df_100$Species)
+
+# ------------------------------------------------------------------------------
+# 3. GENERATE iTOL TREE & ANNOTATION FILES
+# ------------------------------------------------------------------------------
+lineage_df_itol_100 <- lineage_df_100 %>%
+  mutate(across(everything(), ~ gsub(" ", "_", .))) %>%
+  mutate(across(everything(), as.factor))
+
+top_species_itol_100 <- matched_top_100 %>%
+  mutate(Taxa = gsub(" ", "_", Taxa))
+
+# A. Export Newick Tree (.tree)
+tree_obj_100 <- as.phylo(~Phylum/Class/Order/Family/Genus/Species, data = lineage_df_itol_100)
+write.tree(tree_obj_100, file = "bacterial_taxonomy_top100.tree")
+
+# B. Export Phylum Color Ranges (itol_phylum_colors_top100.txt)
+species_phylum_map_100 <- lineage_df_itol_100 %>%
+  select(Species, Phylum) %>%
+  distinct()
+
+unique_phyla_100   <- unique(species_phylum_map_100$Phylum)
+num_phyla_100      <- length(unique_phyla_100)
+palette_colors_100 <- RColorBrewer::brewer.pal(min(max(3, num_phyla_100), 12), "Set3")[1:num_phyla_100]
+
+phylum_color_df_100 <- data.frame(Phylum = unique_phyla_100, Color = palette_colors_100)
+tip_colors_100      <- species_phylum_map_100 %>% inner_join(phylum_color_df_100, by = "Phylum")
+
+color_header    <- c("TREE_COLORS", "SEPARATOR TAB", "DATA", "# ID_or_node_name\tTYPE\tCOLOR\tLABEL_OR_STYLE")
+color_body_tips <- sprintf("%s\trange\t%s\t%s", tip_colors_100$Species, tip_colors_100$Color, tip_colors_100$Phylum)
+writeLines(c(color_header, color_body_tips), con = "itol_phylum_colors_top100.txt")
+
+# C. Export Relative Abundance Simplebar (itol_abundance_bars_top100.txt)
+bar_header <- c(
+  "DATASET_SIMPLEBAR",
+  "SEPARATOR TAB",
+  "DATASET_LABEL\tMean Relative Abundance (%)",
+  "COLOR\t#3182bd",
+  "WIDTH\t200",
+  "DATA"
+)
+bar_body_100 <- sprintf("%s\t%.2f", top_species_itol_100$Taxa, top_species_itol_100$Mean_Abundance)
+writeLines(c(bar_header, bar_body_100), con = "itol_abundance_bars_top100.txt")
+
+# D. Export Branch Colors for Opportunistic & Native Aquatic Taxa
+opportunistic_taxa <- c(
+  "Enterococcus", "Staphylococcus", "Klebsiella", "Acinetobacter", "Pseudomonas", 
+  "Enterobacter", "Escherichia", "Salmonella", "Citrobacter", "Kluyvera", 
+  "Aeromonas", "Vibrio", "Legionella", "Stenotrophomonas", "Serratia",
+  "Arcobacter", "Aliarcobacter", "Campylobacter", "Helicobacter",
+  "Mycobacterium", "Mycolicibacterium", "Mycobacteroides",
+  "Clostridium", "Bacteroides", "Fusobacterium"
+)
+
+native_aquatic_taxa <- c(
+  "Microcystis", "Synechococcus", "Cyanobium", "Planktothrix", "Anabaena", "Dolichospermum",
+  "Polynucleobacter", "Limnohabitans", "Rhodoferax", "Curvibacter", "Variovorax", 
+  "Thauera", "Acidovorax", "Comamonas", "Delftia", "Massilia",
+  "Flavobacterium", "Chryseobacterium", "Cloacibacterium", "Fluviibacter",
+  "Erythrobacter", "Phenylobacterium", "Methylopumilus", "Rheinheimera", "Desulfovibrio"
+)
+
+branch_colors <- lineage_df_itol_100 %>%
+  select(Species, Phylum, Family, Genus) %>%
+  distinct() %>%
+  mutate(
+    Genus_clean  = gsub("_", " ", Genus),
+    Family_clean = gsub("_", " ", Family),
+    Phylum_clean = gsub("_", " ", Phylum),
+    Category = case_when(
+      Phylum_clean == "Cyanobacteriota" ~ "Native",
+      Genus_clean %in% opportunistic_taxa ~ "Opportunistic",
+      Family_clean %in% c("Enterobacteriaceae", "Arcobacteraceae", "Mycobacteriaceae", "Aeromonadaceae") ~ "Opportunistic",
+      Genus_clean %in% native_aquatic_taxa ~ "Native",
+      Family_clean %in% c("Comamonadaceae", "Flavobacteriaceae", "Rhodocyclaceae") ~ "Native",
+      TRUE ~ "Other"
+    ),
+    Color = case_when(
+      Category == "Opportunistic" ~ "#e41a1c",
+      Category == "Native"        ~ "#2ca02c",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Color))
+
+color_body_branches     <- sprintf("%s\tbranch\t%s", branch_colors$Species, branch_colors$Color)
+color_body_reset_labels <- sprintf("%s\tlabel\t#000000", branch_colors$Species)
+color_header_branches   <- c("TREE_COLORS", "SEPARATOR TAB", "DATA", "# ID\tTYPE\tCOLOR")
+
+writeLines(c(color_header_branches, color_body_branches, color_body_reset_labels), con = "itol_branch_colors.txt")
+```
+
+---
+
+#### 4.2 Panels B & C: Abundance Comparison and Microbial Co-occurrence Network
+```{r 04b-figure2-panels-bc, fig.width=8.5, fig.height=5.2}
+# ------------------------------------------------------------------------------
+# 1. LOAD DATA & STRICT GENUS-LEVEL FILTERING
+# ------------------------------------------------------------------------------
+genus_data <- data_rel_taxa %>%
+  filter(!Taxa %in% non_bacterial_taxa) %>%
+  filter(Taxonomic_level == "Genus") %>%
+  mutate(
+    Sample_name   = str_trim(Sample_name),
+    State         = str_trim(State),
+    Effluent_type = str_trim(Effluent_type),
+    Genus         = str_trim(Taxa)
+  ) %>%
+  group_by(Sample_name, State, Effluent_type, Genus) %>%
+  summarise(Relative_abundance = sum(Relative_abundance, na.rm = TRUE), .groups = "drop")
+
+# Harmonized taxonomic group definitions
+opportunistic_taxa <- c(
+  "Enterococcus", "Staphylococcus", "Klebsiella", "Acinetobacter", "Pseudomonas", 
+  "Enterobacter", "Escherichia", "Salmonella", "Citrobacter", "Kluyvera", 
+  "Aeromonas", "Vibrio", "Legionella", "Stenotrophomonas", "Serratia",
+  "Arcobacter", "Aliarcobacter", "Campylobacter", "Helicobacter",
+  "Mycobacterium", "Mycolicibacterium", "Mycobacteroides",
+  "Clostridium", "Bacteroides", "Fusobacterium"
+)
+
+native_aquatic_taxa <- c(
+  "Microcystis", "Synechococcus", "Cyanobium", "Planktothrix", "Anabaena", "Dolichospermum",
+  "Polynucleobacter", "Limnohabitans", "Rhodoferax", "Curvibacter", "Variovorax", 
+  "Thauera", "Acidovorax", "Comamonas", "Delftia", "Massilia", "Streptomyces",
+  "Flavobacterium", "Chryseobacterium", "Cloacibacterium", "Fluviibacter",
+  "Erythrobacter", "Phenylobacterium", "Methylopumilus", "Rheinheimera", "Desulfovibrio"
+)
+
+group_colors <- c(
+  "Opportunistic pathogens" = "#7b1fa2", # Purple
+  "Native aquatic taxa"     = "#1874cd"  # Steel Blue
+)
+
+# ------------------------------------------------------------------------------
+# PANEL B: GLOBAL ABUNDANCE COMPARISON (WILCOXON TEST)
+# ------------------------------------------------------------------------------
+df_global <- genus_data %>%
+  mutate(
+    Category = case_when(
+      Genus %in% opportunistic_taxa ~ "Opportunistic pathogens",
+      Genus %in% native_aquatic_taxa ~ "Native aquatic taxa",
+      TRUE ~ "Other core taxa"
+    )
+  ) %>%
+  filter(Category %in% c("Opportunistic pathogens", "Native aquatic taxa")) %>%
+  mutate(Category = factor(Category, levels = c("Opportunistic pathogens", "Native aquatic taxa"))) %>%
+  group_by(Sample_name, Category) %>%
+  summarise(Total_Abundance = sum(Relative_abundance, na.rm = TRUE), .groups = "drop")
+
+panel_b <- ggplot(df_global, aes(x = Category, y = Total_Abundance, fill = Category)) +
+  geom_boxplot(alpha = 0.85, outlier.shape = 21, outlier.fill = "white", width = 0.45) +
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1.8) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.signif",
+    symnum.args = list(
+      cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), 
+      symbols = c("italic(p) < 0.0001", "italic(p) < 0.001", "italic(p) < 0.01", "italic(p) < 0.05", "ns")
+    ),
+    geom = "text",
+    parse = TRUE,
+    label.x = 1.35, 
+    label.y = 95,
+    size = 3.8
+  ) +
+  scale_fill_manual(values = group_colors) +
+  scale_x_discrete(labels = c("Opportunistic\npathogens", "Native aquatic\ntaxa")) +
+  labs(
+    y = "Cumulative Relative Abundance (%)",
+    x = ""
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x  = element_text(size = 9, face = "bold", color = "black"),
+    axis.text.y  = element_text(size = 9, color = "black"),
+    axis.title.y = element_text(size = 9.5, face = "bold"),
+    plot.margin  = margin(10, 15, 10, 10)
+  )
+
+# ------------------------------------------------------------------------------
+# PANEL C: NETWORK WITH STACKED CENTERED LEGENDS (FORCED TOP 12)
+# ------------------------------------------------------------------------------
+# 1. Seleccionar estrictamente los 12 géneros más abundantes de cada grupo
+top_opp_12 <- genus_data %>%
+  filter(Genus %in% opportunistic_taxa) %>%
+  group_by(Genus) %>%
+  summarise(Mean_Abund = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Mean_Abund)) %>%
+  slice_head(n = 12) %>%
+  pull(Genus)
+
+top_nat_12 <- genus_data %>%
+  filter(Genus %in% native_aquatic_taxa) %>%
+  group_by(Genus) %>%
+  summarise(Mean_Abund = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Mean_Abund)) %>%
+  slice_head(n = 12) %>%
+  pull(Genus)
+
+selected_24_taxa <- c(top_opp_12, top_nat_12)
+
+# 2. Construir la matriz de abundancia PURA únicamente con los 24 géneros seleccionados
+wide_matrix_24 <- genus_data %>%
+  filter(Genus %in% selected_24_taxa) %>%
+  pivot_wider(names_from = Genus, values_from = Relative_abundance, values_fill = 0)
+
+# Extraer solo las columnas numéricas correspondientes a los 24 géneros
+counts_mat_24 <- as.matrix(wide_matrix_24[, selected_24_taxa])
+
+# 3. Correlación de Spearman (|r_s| >= 0.3, p < 0.05)
+cor_res <- Hmisc::rcorr(counts_mat_24, type = "spearman")
+r_mat   <- cor_res$r
+p_mat   <- cor_res$P
+
+r_mat[abs(r_mat) < 0.3 | p_mat >= 0.05] <- 0
+diag(r_mat) <- 0
+
+# 4. Construir la red igraph
+net <- graph_from_adjacency_matrix(r_mat, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+# Filtrar nodos sin conexiones si los hubiera
+connected_nodes <- rowSums(r_mat != 0) > 0
+net <- induced_subgraph(net, vids = names(connected_nodes)[connected_nodes])
+
+V(net)$Category <- case_when(
+  V(net)$name %in% opportunistic_taxa ~ "Opportunistic pathogens",
+  V(net)$name %in% native_aquatic_taxa ~ "Native aquatic taxa",
+  TRUE ~ "Other core taxa"
+)
+
+node_order <- order(V(net)$Category, V(net)$name)
+net        <- permute(net, node_order)
+
+V(net)$Category <- factor(V(net)$Category, levels = c("Opportunistic pathogens", "Native aquatic taxa"))
+E(net)$type     <- ifelse(E(net)$weight > 0, "Positive", "Negative")
+E(net)$type     <- factor(E(net)$type, levels = c("Positive", "Negative"))
+
+tbl_net <- as_tbl_graph(net)
+
+panel_c <- ggraph(tbl_net, layout = "linear", circular = TRUE) +
+  geom_edge_link(aes(color = type), alpha = 0.6, linewidth = 0.65) +
+  geom_node_point(aes(fill = Category), shape = 21, size = 5.5, color = "black", stroke = 0.3) +
+  geom_node_text(aes(label = name), fontface = "italic", size = 2.8, repel = TRUE, box.padding = 0.3) +
+  scale_fill_manual(
+    values = group_colors, 
+    name = "Taxonomic group",
+    guide = guide_legend(order = 1, title.position = "left", nrow = 1)
+  ) +
+  scale_edge_color_manual(
+    values = c("Positive" = "#27ae60", "Negative" = "#e74c3c"), 
+    name = "Correlation type",
+    guide = guide_legend(order = 2, title.position = "left", nrow = 1)
+  ) +
+  labs(
+    title = bquote(plain("Spearman rank correlation |") * r[s] * plain("| ") >= 0.3 * plain(", ") * italic("p") ~ plain("< 0.05"))
+  ) +
+  theme_void() +
+  theme(
+    plot.title      = element_text(size = 9, hjust = 0.5, color = "black", margin = margin(b = 8)),
+    legend.position = "bottom",
+    legend.box      = "vertical",
+    legend.box.just = "center",
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.text     = element_text(size = 8),
+    plot.margin     = margin(10, 10, 10, 10)
+  )
+
+# ------------------------------------------------------------------------------
+# COMBINE PANELS B AND C & DISPLAY
+# ------------------------------------------------------------------------------
+bottom_panels <- (panel_b | panel_c) +
+  plot_layout(widths = c(1, 1.6)) +
+  plot_annotation(
+    tag_levels = list(c('B', 'C'))
+  ) & 
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+print(bottom_panels)
+
+# Export SVG & TIFF
+svglite::svglite("Panels_BC_LowerPage_Final.svg", width = 8.5, height = 5.2)
+print(bottom_panels)
+dev.off()
+
+ggsave("Panels_BC_LowerPage_Final.tiff", plot = bottom_panels, width = 8.5, height = 5.2, dpi = 300, compression = "lzw")
+```
+
+---
+
+### Module 5. Spatial and Environmental Abundance Distribution Across Sampling Sites
+
+This section performs non-parametric statistical evaluations across the Top 20 harmonized bacterial genera (supporting **Figure 3**). Differences across geographical regions (States) are assessed via Kruskal-Wallis $H$-tests followed by Benjamini-Hochberg (FDR) adjusted pairwise Wilcoxon rank-sum tests. Differences between water body types (Lentic vs. Lotic) are evaluated using Wilcoxon rank-sum tests with FDR correction. All analytical summaries are consolidated into a single structured worksheet as **Table S6**.
+
+```{r 05-figure3-heatmap, fig.width=9, fig.height=7, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 1. LOAD DATA & FILTER STRICTLY AT GENUS LEVEL
+# ------------------------------------------------------------------------------
+genus_data_fig3 <- data_rel_taxa %>%
+  filter(!Taxa %in% non_bacterial_taxa) %>%
+  filter(Taxonomic_level == "Genus") %>%
+  mutate(
+    Sample_name   = str_trim(Sample_name),
+    State         = str_trim(State),
+    Effluent_type = str_trim(Effluent_type),
+    Genus         = str_trim(Taxa)
+  ) %>%
+  group_by(Sample_name, State, Effluent_type, Genus) %>%
+  summarise(Relative_abundance = sum(Relative_abundance, na.rm = TRUE), .groups = "drop")
+
+# ------------------------------------------------------------------------------
+# 2. SELECT TOP 20 GLOBAL GENERA BY MEAN ABUNDANCE
+# ------------------------------------------------------------------------------
+top_20_info <- genus_data_fig3 %>%
+  group_by(Genus) %>%
+  summarise(Mean_Abundance = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Mean_Abundance)) %>%
+  slice(1:20) %>%
+  mutate(
+    Category = case_when(
+      Genus %in% opportunistic_taxa ~ "Opportunistic pathogens",
+      Genus %in% native_aquatic_taxa ~ "Native aquatic taxa",
+      TRUE ~ "Other core taxa"
+    )
+  )
+
+# Sort genera strictly by Mean Abundance within each category
+top_20_info$Category <- factor( top_20_info$Category, 
+  levels = c("Opportunistic pathogens", "Native aquatic taxa", "Other core taxa")
+)
+
+ordered_genera <- top_20_info %>%
+  arrange(Category, desc(Mean_Abundance)) %>%
+  pull(Genus)
+
+# ------------------------------------------------------------------------------
+# 3. PREPARE Z-SCORE MATRIX & NUMERICALLY SORT SITES WITHIN STATES
+# ------------------------------------------------------------------------------
+heatmap_df <- genus_data_fig3 %>%
+  filter(Genus %in% ordered_genera)
+
+matrix_wide <- heatmap_df %>%
+  select(Sample_name, Genus, Relative_abundance) %>%
+  pivot_wider(names_from = Sample_name, values_from = Relative_abundance, values_fill = 0)
+
+mat_data <- as.matrix(matrix_wide[, -1])
+rownames(mat_data) <- matrix_wide$Genus
+
+# Sort rows matching category-then-abundance hierarchy
+mat_data <- mat_data[ordered_genera, ]
+
+# Row Z-score normalization
+mat_zscore <- t(scale(t(mat_data)))
+mat_zscore[is.na(mat_zscore)] <- 0
+
+# Sort sites numerically within states
+sample_info <- genus_data_fig3 %>%
+  select(Sample_name, State, Effluent_type) %>%
+  distinct() %>%
+  mutate(
+    site_prefix  = str_extract(Sample_name, "^[A-Za-z]+"),
+    site_number  = as.numeric(str_extract(Sample_name, "[0-9]+")),
+    state_factor = factor(State, levels = c("Mexico City", "Morelos", "State of Mexico", "Tlaxcala"))
+  ) %>%
+  arrange(state_factor, site_number)
+
+mat_zscore <- mat_zscore[, sample_info$Sample_name]
+
+# Row categories metadata dataframe
+row_info <- data.frame(Genus = rownames(mat_zscore)) %>%
+  left_join(top_20_info %>% select(Genus, Category), by = "Genus")
+
+# ------------------------------------------------------------------------------
+# 4. COLOR PALETTES AND ANNOTATIONS
+# ------------------------------------------------------------------------------
+category_colors <- c(
+  "Opportunistic pathogens" = "#7b1fa2", # Purple
+  "Native aquatic taxa"     = "#2F8FE4", # Prussian Blue
+  "Other core taxa"         = "#f39c12"  # Amber/Yellow
+)
+
+effluent_colors <- c("Lentic" = "#a65628", "Lotic" = "#009688")
+state_colors    <- c(
+  "Mexico City"     = "#881146", 
+  "Morelos"         = "#5c9ecc", 
+  "State of Mexico" = "#e377c2", 
+  "Tlaxcala"        = "#ffed00"
+)
+
+top_annotation <- HeatmapAnnotation(
+  `Effluent Type` = sample_info$Effluent_type,
+  State           = sample_info$State,
+  col = list(
+    `Effluent Type` = effluent_colors,
+    State           = state_colors
+  ),
+  annotation_name_side = "right",
+  annotation_name_gp   = gpar(fontsize = 8, fontface = "bold")
+)
+
+left_annotation <- rowAnnotation(
+  Category             = row_info$Category,
+  col                  = list(Category = category_colors),
+  show_annotation_name = FALSE,
+  show_legend          = FALSE 
+)
+
+category_legend <- Legend(
+  title     = "Category",
+  labels    = names(category_colors),
+  legend_gp = gpar(fill = category_colors),
+  title_gp  = gpar(fontsize = 9, fontface = "bold"),
+  labels_gp = gpar(fontsize = 8)
+)
+
+col_fun <- colorRamp2(c(-2, 0, 2, 4, 6), c("#f7f7f7", "#d9d9d9", "#969696", "#525252", "#000000"))
+
+# ------------------------------------------------------------------------------
+# 5. RENDER HEATMAP AND EXPORT HIGH-RES FILES
+# ------------------------------------------------------------------------------
+ht <- Heatmap(
+  mat_zscore,
+  name                 = "Z-score",
+  col                  = col_fun,
+  rect_gp              = gpar(col = "white", lwd = 0.5),
+  top_annotation       = top_annotation,
+  left_annotation      = left_annotation,
+  row_split            = row_info$Category,
+  row_title            = NULL,
+  cluster_rows         = FALSE,                
+  cluster_columns      = FALSE,                
+  show_column_names    = TRUE,
+  column_names_gp      = gpar(fontsize = 7.5),
+  row_names_gp         = gpar(fontsize = 9, fontface = "italic"),
+  column_title         = NULL,
+  heatmap_legend_param = list(
+    title          = "Relative abundance profiles (Z-score normalized)",
+    title_gp       = gpar(fontsize = 9.5, fontface = "bold"),
+    direction      = "horizontal",
+    title_position = "topcenter",
+    legend_width   = unit(6, "cm")
+  )
+)
+
+# Visualización en la salida del R Markdown
+draw(
+  ht, 
+  heatmap_legend_side    = "top", 
+  annotation_legend_side = "right",
+  annotation_legend_list = list(category_legend)
+)
+
+# Exportar en SVG
+svglite::svglite("Figure3_Final.svg", width = 9.0, height = 7.0)
+draw(
+  ht, 
+  heatmap_legend_side    = "top", 
+  annotation_legend_side = "right",
+  annotation_legend_list = list(category_legend)
+)
+dev.off()
+
+# Export TIFF file (using direct graphics device for ComplexHeatmap)
+tiff("Figure3_Final.tiff", width = 9.0, height = 7.0, units = "in", res = 300, compression = "lzw")
+draw(
+  ht, 
+  heatmap_legend_side    = "top", 
+  annotation_legend_side = "right",
+  annotation_legend_list = list(category_legend)
+)
+dev.off()
+
+# ------------------------------------------------------------------------------
+# 6. Generate Supplementary Table S6
+# ------------------------------------------------------------------------------
+
+# 6.1 FILTER STRICTLY AT GENUS LEVEL & HARMONIZE METADATA
+
+genus_data <- data_rel_taxa %>%
+  filter(!Taxa %in% non_bacterial_taxa) %>%
+  filter(Taxonomic_level == "Genus") %>%
+  mutate(
+    Sample_name   = str_trim(Sample_name),
+    State         = str_trim(State),
+    Effluent_type = str_trim(Effluent_type),
+    Genus         = str_trim(Taxa)
+  ) %>%
+  group_by(Sample_name, State, Effluent_type, Genus) %>%
+  summarise(Relative_abundance = sum(Relative_abundance, na.rm = TRUE), .groups = "drop")
+
+# 6.2 HARMONIZED TAXONOMIC LISTS
+
+opportunistic_taxa <- c(
+  "Enterococcus", "Staphylococcus", "Klebsiella", "Acinetobacter", "Pseudomonas", 
+  "Enterobacter", "Escherichia", "Salmonella", "Citrobacter", "Kluyvera", 
+  "Aeromonas", "Vibrio", "Legionella", "Stenotrophomonas", "Serratia",
+  "Arcobacter", "Aliarcobacter", "Campylobacter", "Helicobacter",
+  "Mycobacterium", "Mycolicibacterium", "Mycobacteroides",
+  "Clostridium", "Bacteroides", "Fusobacterium"
+)
+
+native_aquatic_taxa <- c(
+  "Microcystis", "Synechococcus", "Cyanobium", "Planktothrix", "Anabaena", "Dolichospermum",
+  "Polynucleobacter", "Limnohabitans", "Rhodoferax", "Curvibacter", "Variovorax", 
+  "Thauera", "Acidovorax", "Comamonas", "Delftia", "Massilia", "Streptomyces",
+  "Flavobacterium", "Chryseobacterium", "Cloacibacterium", "Fluviibacter",
+  "Erythrobacter", "Phenylobacterium", "Methylopumilus", "Rheinheimera", "Desulfovibrio"
+)
+
+
+# 6.3 SELECT TOP 20 GLOBAL GENERA BY MEAN ABUNDANCE
+
+top_20_genera <- genus_data %>%
+  group_by(Genus) %>%
+  summarise(Mean_Abundance = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Mean_Abundance)) %>%
+  slice(1:20) %>%
+  pull(Genus)
+
+df_top20 <- genus_data %>%
+  filter(Genus %in% top_20_genera) %>%
+  mutate(
+    Category = case_when(
+      Genus %in% opportunistic_taxa ~ "Opportunistic pathogens",
+      Genus %in% native_aquatic_taxa ~ "Native aquatic taxa",
+      TRUE ~ "Other core taxa"
+    )
+  )
+
+# 6.4 KRUSKAL-WALLIS H-TEST ACROSS STATES & POST-HOC WILCOXON
+
+kw_state_results <- df_top20 %>%
+  group_by(Genus, Category) %>%
+  rstatix::kruskal_test(Relative_abundance ~ State) %>%
+  rstatix::adjust_pvalue(method = "fdr") %>% 
+  rstatix::add_significance("p.adj") %>%
+  arrange(p.adj)
+
+sig_state_genera <- kw_state_results %>% filter(p.adj < 0.05) %>% pull(Genus)
+
+if(length(sig_state_genera) > 0) {
+  posthoc_state_results <- df_top20 %>%
+    filter(Genus %in% sig_state_genera) %>%
+    group_by(Genus, Category) %>%
+    rstatix::pairwise_wilcox_test(Relative_abundance ~ State, p.adjust.method = "fdr") %>%
+    rstatix::add_significance("p.adj")
+} else {
+  posthoc_state_results <- data.frame(Note = "No genera showed significant differences across states after FDR correction.")
+}
+
+# 6.5 WILCOXON RANK-SUM TEST ACROSS EFFLUENT TYPES (LENTIC VS LOTIC)
+
+wilcox_effluent_results <- df_top20 %>%
+  group_by(Genus, Category) %>%
+  rstatix::wilcox_test(Relative_abundance ~ Effluent_type) %>%
+  rstatix::adjust_pvalue(method = "fdr") %>% 
+  rstatix::add_significance("p.adj") %>%
+  arrange(p.adj)
+
+# 6.6 EXPORT CONSOLIDATED TABLE S6 TO A SINGLE EXCEL WORKSHEET
+
+wb_s6 <- createWorkbook()
+addWorksheet(wb_s6, "Table_S6_NonParametric_Stats")
+
+# Title (row 1)
+title_text <- "Table S6. Non-parametric Kruskal-Wallis tests of the top 20 most abundant genera across states and water body types. Wilcoxon rank-sum tests are also reported for pairwise comparisons among states and water body types"
+writeData(wb_s6, "Table_S6_NonParametric_Stats", data.frame(Title = title_text), startCol = 1, startRow = 1, colNames = FALSE)
+
+current_row <- 3
+
+# Section 1: Kruskal-Wallis by state
+writeData(wb_s6, "Table_S6_NonParametric_Stats", kw_state_results, startCol = 1, startRow = current_row, colNames = TRUE)
+current_row <- current_row + nrow(kw_state_results) + 3
+
+# Section 2: Subtitle and Post-hoc Wilcoxon by state
+writeData(wb_s6, "Table_S6_NonParametric_Stats", data.frame(Subtitle = "Pairwise post hoc Wilcoxon tests across states"), startCol = 1, startRow = current_row, colNames = FALSE)
+current_row <- current_row + 1
+
+writeData(wb_s6, "Table_S6_NonParametric_Stats", posthoc_state_results, startCol = 1, startRow = current_row, colNames = TRUE)
+current_row <- current_row + nrow(posthoc_state_results) + 3
+
+# Section 3: Subtitle and Wilcoxon by water body type
+writeData(wb_s6, "Table_S6_NonParametric_Stats", data.frame(Subtitle = "Pairwise Wilcoxon tests across water body types"), startCol = 1, startRow = current_row, colNames = FALSE)
+current_row <- current_row + 1
+
+writeData(wb_s6, "Table_S6_NonParametric_Stats", wilcox_effluent_results, startCol = 1, startRow = current_row, colNames = TRUE)
+
+# Save Excel file as Table_S6
+saveWorkbook(wb_s6, "Table_S6_Top20_NonParametric_Stats.xlsx", overwrite = TRUE)
+
+cat("-> Table_S6_Top20_NonParametric_Stats.xlsx successfully generated as a single consolidated worksheet!\n")
+
+# 6.7 PRINT TABLE S6 TO HTML FORMAT
+
+kable(kw_state_results, format = "html", caption = "Table S6 (Part 1): Kruskal-Wallis tests across states.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE, position = "center")
+
+kable(posthoc_state_results, format = "html", caption = "Table S6 (Part 2): Pairwise post-hoc Wilcoxon tests across states.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE, position = "center")
+
+kable(wilcox_effluent_results, format = "html", caption = "Table S6 (Part 3): Wilcoxon tests across water body types.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE, position = "center")
+```
+
+---
+
+### Module 6. Clinical and Priority Bacterial Species Profiling (Figure 4)
+
+This section constructs **Figure 4**, depicting the mean relative abundance and spatial detection frequency (%) of target clinical and emerging bacterial pathogens (including ESKAPE-like species and other priority genera) across sampling regions. Outer facets group species by clinical risk category, while inner facets organize taxa by bacterial genus.
+
+```{r 06-figure4-clinical-species, fig.width=9.5, fig.height=11, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 0. DEFINE TARGET SPECIES FOR PATHOGEN PROFILING
+# ------------------------------------------------------------------------------
+target_species <- c(
+  "Acinetobacter baumannii", "Acinetobacter johnsonii", "Acinetobacter lwoffii",
+  "Enterobacter cloacae", "Enterobacter hormaechei",
+  "Klebsiella pneumoniae", "Klebsiella oxytoca",
+  "Pseudomonas aeruginosa", "Pseudomonas putida",
+  "Aeromonas media", "Aeromonas caviae", "Aeromonas veronii",
+  "Aliarcobacter cryaerophilus", "Aliarcobacter butzleri",
+  "Escherichia coli", "Escherichia albertii", "Escherichia fergusonii",
+  "Mycobacterium tuberculosis", "Mycobacterium intracellulare", "Mycobacterium avium"
+)
+
+# ------------------------------------------------------------------------------
+# 1. GENERATE TABLE S7 (PATHOGEN SPECIES ABUNDANCE AND FREQUENCY)
+# ------------------------------------------------------------------------------
+species_summary <- data_rel_taxa %>%
+  filter(!Taxa %in% non_bacterial_taxa) %>%
+  filter(Taxonomic_level == "Species" | Taxa %in% target_species) %>%
+  mutate(
+    Sample_name = str_trim(Sample_name),
+    State       = str_trim(State),
+    Species     = str_trim(Taxa)
+  ) %>%
+  filter(Species %in% target_species) %>%
+  mutate(
+    Genus = word(Species, 1),
+    Group = case_when(
+      Genus %in% c("Acinetobacter", "Enterobacter", "Klebsiella", "Pseudomonas") ~ "ESKAPE pathogens",
+      TRUE ~ "Other priority clinical pathogens"
+    )
+  )
+
+# Calculate total samples per state (n)
+state_counts_s7 <- species_summary %>%
+  distinct(Sample_name, State) %>%
+  group_by(State) %>%
+  summarise(N_samples = n(), .groups = "drop")
+
+# Aggregate metrics by species and state
+table_s7_data <- species_summary %>%
+  group_by(Group, Genus, Species, State) %>%
+  summarise(
+    Mean_Relative_Abundance = mean(Relative_abundance, na.rm = TRUE),
+    SD_Relative_Abundance   = sd(Relative_abundance, na.rm = TRUE),
+    Samples_Detected        = sum(Relative_abundance > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(state_counts_s7, by = "State") %>%
+  mutate(
+    Detection_Frequency_Pct = (Samples_Detected / N_samples) * 100,
+    Mean_Relative_Abundance = round(Mean_Relative_Abundance, 3),
+    SD_Relative_Abundance   = round(coalesce(SD_Relative_Abundance, 0), 3),
+    Detection_Frequency_Pct = round(Detection_Frequency_Pct, 1)
+  ) %>%
+  select(
+    Group,
+    Genus,
+    Species,
+    State,
+    `Total Samples (n)`           = N_samples,
+    `Mean Relative Abundance (%)` = Mean_Relative_Abundance,
+    `SD (%)`                      = SD_Relative_Abundance,
+    `Samples Detected`            = Samples_Detected,
+    `Detection Frequency (%)`     = Detection_Frequency_Pct
+  ) %>%
+  arrange(factor(Group, levels = c("ESKAPE pathogens", "Other priority clinical pathogens")), Genus, Species, State)
+
+# Export to Excel Workbook (Table S7)
+wb_s7 <- createWorkbook()
+addWorksheet(wb_s7, "Table_S7_Pathogens")
+
+header_style <- createStyle(
+  fontName = "Arial",
+  fontSize = 11,
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  fgFill = "#E0E0E0",
+  border = "TopBottomLeftRight"
+)
+
+writeData(wb_s7, "Table_S7_Pathogens", table_s7_data, startRow = 1, startCol = 1)
+addStyle(wb_s7, "Table_S7_Pathogens", header_style, rows = 1, cols = 1:ncol(table_s7_data), gridExpand = TRUE)
+setColWidths(wb_s7, "Table_S7_Pathogens", cols = 1:ncol(table_s7_data), widths = "auto")
+
+file_output_s7 <- "Table_S7_Pathogen_Species_Abundance_and_Frequency.xlsx"
+saveWorkbook(wb_s7, file_output_s7, overwrite = TRUE)
+
+cat("-> Table_S7_Pathogen_Species_Abundance_and_Frequency.xlsx generated successfully!\n")
+
+# ------------------------------------------------------------------------------
+# 2. Render/Print the table visually in the HTML report
+# ------------------------------------------------------------------------------
+kable(table_s7_data, 
+      format = "html", 
+      caption = "Table S7. Pathogen species relative abundance and detection frequency across states.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE,
+                position = "center")
+```
+
+---
+
+### Module 7. Bacterial Community Dissimilarity and Beta Diversity (Figure 5)
+
+This section constructs **Figure 5**, depicting the Principal Coordinates Analysis (PCoA) based on the Bray-Curtis distance matrix at the genus level. Panel A evaluates multivariate community structuring across geographical regions (States), while Panel B compares dissimilarity between water body types (Lentic vs. Lotic). Statistical significance and group dispersion variance are calculated via PERMANOVA (`adonis2`) and PERMDISP (`betadisper`), respectively.
+
+```{r 07-figure5-pcoa-betadiversity, fig.width=11, fig.height=5.5, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 1. LOAD BRAY-CURTIS MATRIX & METADATA DERIVATION
+# ------------------------------------------------------------------------------
+bray_matrix <- read.csv("Table_Article_BrayCurtis_Matrix_Genus.csv", row.names = 1, check.names = FALSE)
+bray_dist   <- as.dist(bray_matrix)
+
+metadata <- data_rel_taxa %>%
+  mutate(
+    Sample_name = str_replace(Sample_name, "^([A-Z]+)0*", "\\1")
+  ) %>%
+  select(Sample_name, State, Effluent_type) %>%
+  distinct()
+
+sample_names <- rownames(as.matrix(bray_dist))
+
+metadata <- metadata %>%
+  filter(Sample_name %in% sample_names) %>%
+  arrange(match(Sample_name, sample_names))
+
+metadata$State <- factor(metadata$State, levels = c("Mexico City", "Morelos", "State of Mexico", "Tlaxcala"))
+
+# ------------------------------------------------------------------------------
+# 2. PCOA EIGENVALUE CALCULATION
+# ------------------------------------------------------------------------------
+pcoa_res    <- cmdscale(bray_dist, k = 2, eig = TRUE)
+pcoa_points <- as.data.frame(pcoa_res$points)
+colnames(pcoa_points) <- c("PCoA1", "PCoA2")
+
+var_pcoa1 <- round((pcoa_res$eig[1] / sum(pcoa_res$eig)) * 100, 1)
+var_pcoa2 <- round((pcoa_res$eig[2] / sum(pcoa_res$eig)) * 100, 1)
+
+pcoa_data <- cbind(metadata, pcoa_points)
+
+# ------------------------------------------------------------------------------
+# 3. PERMANOVA & PERMDISP STATISTICAL TESTS
+# ------------------------------------------------------------------------------
+set.seed(123)
+perm_state <- adonis2(bray_dist ~ State, data = metadata, permutations = 999)
+r2_state   <- round(perm_state$R2[1], 3) 
+p_state    <- perm_state$`Pr(>F)`[1]
+
+disp_state   <- betadisper(bray_dist, metadata$State)
+p_disp_state <- round(permutest(disp_state, permutations = 999)$tab$`Pr(>F)`[1], 3)
+
+sub_state <- paste0("PERMANOVA: R² = ", r2_state, " (p = ", sprintf("%.3f", p_state), 
+                    ") | PERMDISP: p = ", sprintf("%.3f", p_disp_state))
+
+set.seed(123)
+perm_effluent <- adonis2(bray_dist ~ Effluent_type, data = metadata, permutations = 999)
+r2_effluent   <- round(perm_effluent$R2[1], 3) 
+p_effluent    <- perm_effluent$`Pr(>F)`[1]
+
+disp_effluent   <- betadisper(bray_dist, metadata$Effluent_type)
+p_disp_effluent <- round(permutest(disp_effluent, permutations = 999)$tab$`Pr(>F)`[1], 3)
+
+sub_effluent <- paste0("PERMANOVA: R² = ", r2_effluent, " (p = ", sprintf("%.3f", p_effluent), 
+                       ") | PERMDISP: p = ", sprintf("%.3f", p_disp_effluent))
+
+# ------------------------------------------------------------------------------
+# 4. PALETTES AND THEME
+# ------------------------------------------------------------------------------
+state_colors <- c(
+  "Mexico City"     = "#8BCEBA", 
+  "Morelos"         = "#A5B6D9", 
+  "State of Mexico" = "#EFC24A", 
+  "Tlaxcala"        = "#9D559E"
+)
+
+wbt_colors <- c(
+  "Lentic" = "#E8685D", 
+  "Lotic"  = "#86C186"
+)
+
+theme_pcoa <- theme_bw(base_size = 11, base_family = "sans") +
+  theme(
+    plot.title        = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle     = element_text(size = 9, hjust = 0.5, color = "grey20"),
+    axis.title        = element_text(size = 10, face = "bold"),
+    axis.text         = element_text(size = 9, color = "grey10"),
+    panel.grid.major  = element_line(color = "grey92", linewidth = 0.4),
+    panel.grid.minor  = element_blank(),
+    panel.border      = element_rect(color = "grey50", fill = NA, linewidth = 0.7),
+    legend.title      = element_text(size = 9.5, face = "bold"),
+    legend.text       = element_text(size = 9),
+    legend.background = element_blank()
+  )
+
+# ------------------------------------------------------------------------------
+# 5. BUILD PANELS & COMBINE
+# ------------------------------------------------------------------------------
+pA <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = State, fill = State)) +
+  stat_ellipse(geom = "polygon", alpha = 0.18, level = 0.95, linetype = 2, linewidth = 0.6) +
+  geom_point(size = 3, alpha = 0.85, shape = 21, stroke = 0.6, color = "grey15") +
+  scale_color_manual(values = state_colors, name = "State") +
+  scale_fill_manual(values = state_colors, name = "State") +
+  labs(
+    title    = "State",
+    subtitle = sub_state,
+    x        = paste0("PCoA1 (Bray-Curtis: ", var_pcoa1, "%)"),
+    y        = paste0("PCoA2 (Bray-Curtis: ", var_pcoa2, "%)")
+  ) +
+  theme_pcoa
+
+pB <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = Effluent_type, fill = Effluent_type)) +
+  stat_ellipse(geom = "polygon", alpha = 0.18, level = 0.95, linetype = 2, linewidth = 0.6) +
+  geom_point(size = 3, alpha = 0.85, shape = 21, stroke = 0.6, color = "grey15") +
+  scale_color_manual(values = wbt_colors, name = "Water body type") +
+  scale_fill_manual(values = wbt_colors, name = "Water body type") +
+  labs(
+    title    = "Water body type",
+    subtitle = sub_effluent,
+    x        = paste0("PCoA1 (Bray-Curtis: ", var_pcoa1, "%)"),
+    y        = paste0("PCoA2 (Bray-Curtis: ", var_pcoa2, "%)")
+  ) +
+  theme_pcoa
+
+fig5 <- (pA | pB) + 
+  plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(face = "bold", size = 14))
+
+# Display plot in output
+print(fig5)
+
+# ------------------------------------------------------------------------------
+# 6. EXPORT OUTPUT FILES
+# ------------------------------------------------------------------------------
+svglite::svglite("Figure_5.svg", width = 11, height = 5.5)
+print(fig5)
+dev.off()
+
+ggsave("Figure_5.tiff", plot = fig5, width = 11, height = 5.5, dpi = 300, compression = "lzw")
+```
+
+---
+
+### Module 8. Resistome Beta Diversity and Community Dissimilarity (Figure 6)
+
+This section constructs **Figure 6**, depicting the Principal Coordinates Analysis (PCoA) of the aquatic resistome based on Bray-Curtis dissimilarity calculated from RPKG abundance matrices of antimicrobial resistance genes (ARGs). Panel A evaluates geographic separation across States, while Panel B compares resistome dissimilarity between water body types (Lentic vs. Lotic). Statistical significance and dispersion variance are calculated using PERMANOVA (`adonis2`) and PERMDISP (`betadisper`).
+
+```{r 08-figure6-resistome-pcoa, fig.width=10.5, fig.height=5.5, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 1. LOAD DATA & BUILD RESISTOME MATRICES
+# ------------------------------------------------------------------------------
+arg_df <- read.xlsx("Resistome.xlsx") %>%
+  mutate(
+    Sample_name   = str_trim(Sample_name),
+    Gene          = str_trim(`gene_unif_final_manual`),
+    State         = str_trim(State),
+    Effluent_type = str_trim(Effluent_type)
+  )
+
+arg_abundance_matrix <- arg_df %>%
+  group_by(Sample_name, Gene) %>%
+  summarise(RPKG = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Gene, values_from = RPKG, values_fill = 0)
+
+metadata_arg <- arg_df %>%
+  select(Sample_name, State, Effluent_type) %>%
+  distinct() %>%
+  filter(!is.na(State) & !is.na(Effluent_type) & State != "" & Effluent_type != "")
+
+common_samples <- intersect(arg_abundance_matrix$Sample_name, metadata_arg$Sample_name)
+
+metadata_arg <- metadata_arg %>%
+  filter(Sample_name %in% common_samples) %>%
+  arrange(match(Sample_name, common_samples))
+
+arg_mat_df <- arg_abundance_matrix %>%
+  filter(Sample_name %in% common_samples) %>%
+  arrange(match(Sample_name, common_samples))
+
+arg_mat <- as.matrix(arg_mat_df[, -1])
+rownames(arg_mat) <- arg_mat_df$Sample_name
+
+arg_dist <- vegdist(arg_mat, method = "bray")
+
+# ------------------------------------------------------------------------------
+# 2. PCOA & STATISTICAL TESTS (PERMANOVA & PERMDISP)
+# ------------------------------------------------------------------------------
+pcoa_res    <- cmdscale(arg_dist, k = 2, eig = TRUE)
+pcoa_points <- as.data.frame(pcoa_res$points)
+colnames(pcoa_points) <- c("PCoA1", "PCoA2")
+
+var_pcoa1 <- round((pcoa_res$eig[1] / sum(pcoa_res$eig)) * 100, 1)
+var_pcoa2 <- round((pcoa_res$eig[2] / sum(pcoa_res$eig)) * 100, 1)
+
+pcoa_data <- cbind(metadata_arg, pcoa_points)
+
+set.seed(123)
+perm_state <- adonis2(arg_dist ~ State, data = metadata_arg, permutations = 999)
+mod_state  <- betadisper(arg_dist, metadata_arg$State)
+disp_state <- permutest(mod_state, permutations = 999)
+sub_state  <- paste0("PERMANOVA: R² = ", round(perm_state$R2[1], 3), 
+                     " (p = ", sprintf("%.3f", perm_state$`Pr(>F)`[1]), 
+                     ") | PERMDISP: p = ", sprintf("%.3f", disp_state$tab$`Pr(>F)`[1]))
+
+set.seed(123)
+perm_effluent <- adonis2(arg_dist ~ Effluent_type, data = metadata_arg, permutations = 999)
+mod_effluent  <- betadisper(arg_dist, metadata_arg$Effluent_type)
+disp_effluent <- permutest(mod_effluent, permutations = 999)
+sub_effluent  <- paste0("PERMANOVA: R² = ", round(perm_effluent$R2[1], 3), 
+                        " (p = ", sprintf("%.3f", perm_effluent$`Pr(>F)`[1]), 
+                        ") | PERMDISP: p = ", sprintf("%.3f", disp_effluent$tab$`Pr(>F)`[1]))
+
+# ------------------------------------------------------------------------------
+# 3. PALETTES AND THEME
+# ------------------------------------------------------------------------------
+state_colors <- c("Mexico City" = "#8BCEBA", "Morelos" = "#A5B6D9", "State of Mexico" = "#EFC24A", "Tlaxcala" = "#9D559E")
+wbt_colors   <- c("Lentic" = "#E8685D", "Lotic" = "#86C186")
+
+theme_pcoa <- theme_bw(base_size = 10, base_family = "sans") +
+  theme(
+    plot.title       = element_text(face = "bold", size = 11, hjust = 0.5),
+    plot.subtitle    = element_text(size = 8.5, hjust = 0.5, color = "grey20"),
+    axis.title       = element_text(size = 9.5, face = "bold"),
+    axis.text        = element_text(size = 8.5, color = "grey10"),
+    panel.grid.major = element_line(color = "grey92", linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.border     = element_rect(color = "grey50", fill = NA, linewidth = 0.6),
+    legend.title     = element_text(size = 9, face = "bold"),
+    legend.text      = element_text(size = 8.5)
+  )
+
+# ------------------------------------------------------------------------------
+# 4. BUILD GGPLOT PANELS & COMBINE
+# ------------------------------------------------------------------------------
+pA <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = State, fill = State)) +
+  stat_ellipse(geom = "polygon", alpha = 0.18, level = 0.95, linetype = 2, linewidth = 0.6) +
+  geom_point(position = position_jitter(width = 0.015, height = 0.015, seed = 123), 
+             size = 3, alpha = 0.85, shape = 21, stroke = 0.6, color = "grey15") +
+  scale_color_manual(values = state_colors, name = "State") +
+  scale_fill_manual(values = state_colors, name = "State") +
+  labs(title = "Resistome by State", subtitle = sub_state, 
+       x = paste0("PCoA1 (", var_pcoa1, "%)"), y = paste0("PCoA2 (", var_pcoa2, "%)")) + 
+  theme_pcoa
+
+pB <- ggplot(pcoa_data, aes(x = PCoA1, y = PCoA2, color = Effluent_type, fill = Effluent_type)) +
+  stat_ellipse(geom = "polygon", alpha = 0.18, level = 0.95, linetype = 2, linewidth = 0.6) +
+  geom_point(position = position_jitter(width = 0.015, height = 0.015, seed = 123), 
+             size = 3, alpha = 0.85, shape = 21, stroke = 0.6, color = "grey15") +
+  scale_color_manual(values = wbt_colors, name = "Water body type") +
+  scale_fill_manual(values = wbt_colors, name = "Water body type") +
+  labs(title = "Resistome by Water body type", subtitle = sub_effluent, 
+       x = paste0("PCoA1 (", var_pcoa1, "%)"), y = paste0("PCoA2 (", var_pcoa2, "%)")) + 
+  theme_pcoa
+
+fig6 <- pA + pB + plot_annotation(tag_levels = 'A') & theme(plot.tag = element_text(face = "bold", size = 13))
+
+# Display plot in document output
+print(fig6)
+
+# ------------------------------------------------------------------------------
+# 5. EXPORT HIGH-RESOLUTION FILES & DISPLAY IN PLOTS TAB
+# ------------------------------------------------------------------------------
+# A. Exportar SVG
+svglite::svglite("Figure_6_Resistome_PCoA.svg", width = 10.5, height = 5.5)
+print(fig6)
+dev.off()
+
+# B. Exportar TIFF (300 DPI, compresión LZW)
+ggsave("Figure_6_Resistome_PCoA.tiff", plot = fig6, width = 10.5, height = 5.5, dpi = 300, compression = "lzw")
+
+# C. Imprimir AL FINAL para renderizar en la pestaña Plots de RStudio
+print(fig6)
+```
+
+---
+
+### Module 9. Abundance and Spatial Profiling of Top 50 Antimicrobial Resistance Genes (Figure 7 & Table S7)
+
+This section constructs **Figure 7**, profiling the Top 50 most abundant antimicrobial resistance genes (ARGs) ranked by total RPKG values and their spatial detection frequencies across water body types (Lentic vs. Lotic). Additionally, it generates **Table S7** and **Figure S4**. Table S7 is a two-tab Excel workbook detailing state-level ARG abundance metrics (mean RPKG, standard deviation, detection frequency) and global cumulative resistome contribution rankings. Figure S4 presents the spatial profiling of the top 50 AMR genes.
+
+```{r 09-figure7-resistome-top50-profile, fig.width=7.8, fig.height=13.0, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 1. LOAD RESISTOME DATA & CALCULATE GLOBAL METRICS
+# ------------------------------------------------------------------------------
+arg_df_raw <- read.xlsx("Resistome.xlsx") %>%
+  mutate(
+    Sample_name   = str_trim(Sample_name),
+    Gene          = str_trim(`gene_unif_final_manual`),
+    Class         = str_trim(refined_class),
+    State         = str_trim(State),
+    Effluent_type = str_trim(Effluent_type),
+    RPKG          = as.numeric(RPKG)
+  )
+
+# Calculate global resistome sum
+total_resistome_rpkg <- sum(arg_df_raw$RPKG, na.rm = TRUE)
+
+# ------------------------------------------------------------------------------
+# 2. CALCULATE RESISTOME CONTRIBUTION (%) BY WATER BODY TYPE
+# ------------------------------------------------------------------------------
+water_body_totals <- arg_df_raw %>%
+  filter(Sample_name != "MOR10") %>%
+  group_by(Effluent_type) %>%
+  summarise(
+    Sum_RPKG = sum(RPKG, na.rm = TRUE),
+    Sample_N = n_distinct(Sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Pct_Resistome = (Sum_RPKG / total_resistome_rpkg) * 100,
+    Water_Body_Label = sprintf("%s\n(n=%d; %.1f%%)", Effluent_type, Sample_N, Pct_Resistome)
+  )
+
+water_body_labels <- setNames(water_body_totals$Water_Body_Label, water_body_totals$Effluent_type)
+water_body_counts <- setNames(water_body_totals$Sample_N, water_body_totals$Effluent_type)
+
+lotic_label  <- water_body_labels["Lotic"]
+lentic_label <- water_body_labels["Lentic"]
+ordered_water_levels <- c(lotic_label, lentic_label)
+
+# ------------------------------------------------------------------------------
+# 3. DEFINE STATE DENOMINATORS & LABELS
+# ------------------------------------------------------------------------------
+state_counts <- c(
+  "Mexico City"     = 7,
+  "Morelos"         = 9,
+  "State of Mexico" = 10,
+  "Tlaxcala"        = 4
+)
+
+state_labels <- c(
+  "Mexico City"     = "Mexico City\n(n=7)",
+  "Morelos"         = "Morelos\n(n=9)",
+  "State of Mexico" = "State of Mexico\n(n=10)",
+  "Tlaxcala"        = "Tlaxcala\n(n=4)"
+)
+
+arg_df <- arg_df_raw %>%
+  mutate(
+    Water_Body_Label = water_body_labels[Effluent_type],
+    Water_Body_Label = factor(Water_Body_Label, levels = ordered_water_levels),
+    State_Label      = state_labels[State],
+    State_Label      = factor(State_Label, levels = unname(state_labels)),
+    Class_clean      = str_replace_all(Class, "(?i)\\s*resistance|\\s*resistant", ""),
+    Class_clean      = str_wrap(Class_clean, width = 22)
+  )
+
+# ------------------------------------------------------------------------------
+# 4. AUDIT TOP 50 ARGs & EXPORT SUMMARY TABLES
+# ------------------------------------------------------------------------------
+sample_level_args <- arg_df %>%
+  group_by(Sample_name, State, State_Label, Effluent_type, Water_Body_Label, Class_clean, Gene) %>%
+  summarise(RPKG_Sample = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+top50_summary <- sample_level_args %>%
+  group_by(Gene, Class_clean) %>%
+  summarise(
+    Total_RPKG = sum(RPKG_Sample, na.rm = TRUE),
+    Mean_RPKG  = mean(RPKG_Sample, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  slice_max(order_by = Total_RPKG, n = 50) %>%
+  arrange(desc(Total_RPKG)) %>%
+  mutate(
+    Percentage_of_Total_RPKG = (Total_RPKG / total_resistome_rpkg) * 100,
+    Cumulative_Percentage    = cumsum(Percentage_of_Total_RPKG)
+  )
+
+write.xlsx(top50_summary, "Table_Figure_6_Top50_ARG_Abundance.xlsx")
+write.csv(top50_summary, "Table_Figure_6_Top50_ARG_Abundance.csv", row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 5. CLASS PERCENTAGES AND HTML FORMATTING FUNCTION
+# ------------------------------------------------------------------------------
+class_subtotals <- arg_df %>%
+  group_by(Class_clean) %>%
+  summarise(Class_Total_RPKG = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    Class_Pct = (Class_Total_RPKG / total_resistome_rpkg) * 100,
+    Class_label = paste0("<span style='font-size:10.5pt;'><b>", Class_clean, "</b></span><br><span style='font-size:8.5pt;color:#222222;'>(" , sprintf("%.1f", Class_Pct), "%)</span>")
+  ) %>%
+  arrange(desc(Class_Total_RPKG))
+
+class_label_order <- class_subtotals$Class_label
+top_args <- top50_summary$Gene
+
+format_gene_exact <- function(gene) {
+  case_when(
+    gene == "blaICR"    ~ "<i>bla</i><sub>ICR</sub>",
+    gene == "blaOXA-2"  ~ "<i>bla</i><sub>OXA-2</sub>",
+    gene == "blaOXA"    ~ "<i>bla</i><sub>OXA</sub>",
+    gene == "blaGES-1"  ~ "<i>bla</i><sub>GES-1</sub>",
+    gene == "blaOXA-10" ~ "<i>bla</i><sub>OXA-10</sub>",
+    
+    gene == "qacEdelta1"     ~ "<i>qacEdelta1</i>",
+    gene == "AAC(6')-Ib-CR"  ~ "<i>aac(6')-Ib-cr</i>",
+    gene == "ANT(3'')"       ~ "<i>ant(3'')</i>",
+    gene == "APH(6)-Id"      ~ "<i>aph(6)-Id</i>",
+    gene == "APH(3'')-Ib"     ~ "<i>aph(3'')-Ib</i>",
+    gene == "APH(3'')-III"    ~ "<i>aph(3'')-III</i>",
+    gene == "AAC(6')"         ~ "<i>aac(6')</i>",
+    
+    gene %in% c("qnrB19-1", "qnrb19-1", "QnrB19-1") ~ "<i>qnrB19-1</i>",
+    gene %in% c("qnrVC", "qnrvc", "QnrVC")         ~ "<i>qnrVC</i>",
+    gene %in% c("qnrS", "qnrs", "QnrS")             ~ "<i>qnrS</i>",
+    gene %in% c("tet(C)", "tet(c)", "Tet(C)")       ~ "<i>tet(C)</i>",
+    gene %in% c("tet(E)", "tet(e)", "Tet(E)")       ~ "<i>tet(E)</i>",
+    gene %in% c("tet(39)", "tet(39)")               ~ "<i>tet(39)</i>",
+    
+    gene %in% c("mtrA", "mtra", "MtrA")             ~ "<i>mtrA</i>",
+    gene %in% c("dfrA", "dfra", "DfrA")             ~ "<i>dfrA</i>",
+    gene %in% c("rbpA", "rbpa", "RbpA")             ~ "<i>rbpA</i>",
+    gene %in% c("msrE", "msre", "MsrE")             ~ "<i>msrE</i>",
+    gene %in% c("mphE-1", "mphe-1")                 ~ "<i>mphE-1</i>",
+    gene %in% c("mphA", "mpha")                     ~ "<i>mphA</i>",
+    gene %in% c("ermB", "ermb")                     ~ "<i>ermB</i>",
+    gene %in% c("cmlA5", "cmla5")                   ~ "<i>cmlA5</i>",
+    gene %in% c("catB3", "catb3")                   ~ "<i>catB3</i>",
+    gene %in% c("mexT", "mext", "MexT")             ~ "<i>mexT</i>",
+    
+    TRUE ~ paste0("<i>", gene, "</i>")
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 6. BUILD FIGURE 7 (WATER BODY TYPE: LOTIC VS LENTIC WITH %)
+# ------------------------------------------------------------------------------
+arg_profile_water <- sample_level_args %>%
+  filter(Gene %in% top_args) %>%
+  left_join(class_subtotals, by = "Class_clean") %>%
+  mutate(Class_label = factor(Class_label, levels = class_label_order)) %>%
+  group_by(Class_label, Gene, Effluent_type, Water_Body_Label) %>%
+  summarise(
+    Mean_RPKG      = mean(RPKG_Sample, na.rm = TRUE),
+    Detection_Freq = (sum(RPKG_Sample > 0) / water_body_counts[unique(Effluent_type)]) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(Water_Body_Label) & Detection_Freq > 0) %>%
+  mutate(Gene_formatted = format_gene_exact(Gene))
+
+fig7 <- ggplot(arg_profile_water, aes(x = Water_Body_Label, y = reorder(Gene_formatted, Mean_RPKG))) +
+  geom_point(
+    aes(size = Detection_Freq, fill = Mean_RPKG), 
+    shape = 21, color = "grey15", stroke = 0.5
+  ) +
+  facet_nested(
+    Class_label ~ ., 
+    scales = "free_y", space = "free_y", switch = "y",
+    nest_line = element_line(color = "grey50", linewidth = 0.5),
+    strip = strip_nested(
+      text_y = list(element_markdown(angle = 0, color = "black")),
+      background_y = list(element_blank())
+    )
+  ) +
+  scale_fill_gradientn(
+    colors = c("#ffffe5", "#fff7bc", "#fec44f", "#fe9929", "#cc4c02", "#8c2d04"),
+    name = "Mean RPKG"
+  ) +
+  scale_size_continuous(
+    range = c(2.5, 7.0),
+    limits = c(0, 100),
+    breaks = c(25, 50, 75, 100),
+    labels = c("25%", "50%", "75%", "100%"),
+    name = "Detection\nfrequency (%)"
+  ) +
+  theme_bw(base_size = 10, base_family = "sans") +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 10.5, face = "bold", color = "black"),
+    axis.text.y = element_markdown(size = 9.0, color = "black"),
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    panel.grid.major = element_line(color = "grey92", linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.6),
+    legend.title = element_text(size = 9.5, face = "bold"),
+    legend.text = element_text(size = 9.0),
+    legend.position = "right"
+  )
+
+# Display plot in document output
+print(fig7)
+
+# Export Figure 7
+svglite::svglite("Figure_7_Resistome_Profile_Lentic_vs_Lotic_Pct.svg", width = 7.8, height = 13.0)
+print(fig7)
+dev.off()
+
+ggsave("Figure_7_Resistome_Profile_Lentic_vs_Lotic_Pct.tiff", plot = fig7, width = 7.8, height = 13.0, dpi = 300, compression = "lzw")
+
+# ------------------------------------------------------------------------------
+# 7. GENERATE TABLE S8 (UNIQUE ARGS RANKED BY TOTAL RPKG & CONTRIBUTION)
+# ------------------------------------------------------------------------------
+clean_args_s8 <- arg_df_raw %>%
+  mutate(
+    Drug_Class  = str_trim(refined_class),
+    ARG_Gene    = str_trim(`gene_unif_final_manual`)
+  )
+
+sample_level_args_s8 <- clean_args_s8 %>%
+  group_by(Sample_name, Drug_Class, ARG_Gene) %>%
+  summarise(RPKG_Sample = sum(RPKG, na.rm = TRUE), .groups = "drop")
+
+all_samples_s8 <- clean_args_s8 %>% select(Sample_name) %>% distinct()
+unique_arg_pairs_s8 <- clean_args_s8 %>% select(Drug_Class, ARG_Gene) %>% distinct()
+
+full_grid_s8 <- expand.grid(
+  Sample_name = all_samples_s8$Sample_name,
+  ARG_Gene    = unique_arg_pairs_s8$ARG_Gene,
+  stringsAsFactors = FALSE
+) %>%
+  left_join(all_samples_s8, by = "Sample_name") %>%
+  left_join(unique_arg_pairs_s8, by = "ARG_Gene") %>%
+  left_join(sample_level_args_s8, by = c("Sample_name", "Drug_Class", "ARG_Gene")) %>%
+  mutate(RPKG_Sample = ifelse(is.na(RPKG_Sample), 0, RPKG_Sample))
+
+# Single table with unique ARGs ranked by global contribution
+table_s8_unique <- full_grid_s8 %>%
+  group_by(Drug_Class, ARG_Gene) %>%
+  summarise(
+    Samples_Detected_Global = sum(RPKG_Sample > 0),
+    Total_RPKG              = sum(RPKG_Sample),
+    Mean_RPKG               = mean(RPKG_Sample),
+    .groups                 = "drop"
+  ) %>%
+  arrange(desc(Total_RPKG)) %>%
+  mutate(
+    Rank                        = row_number(),
+    Global_Resistome_Total      = sum(Total_RPKG, na.rm = TRUE),
+    RPKG_Contribution_Pct       = (Total_RPKG / Global_Resistome_Total) * 100,
+    Cumulative_RPKG             = cumsum(Total_RPKG),
+    Cumulative_Contribution_Pct = cumsum(RPKG_Contribution_Pct)
+  ) %>%
+  select(
+    Rank,
+    `Drug Class`                = Drug_Class,
+    `ARG Gene`                  = ARG_Gene,
+    `Samples Detected (Global)` = Samples_Detected_Global,
+    `Total RPKG`                = Total_RPKG,
+    `Contribution (%)`          = RPKG_Contribution_Pct,
+    `Cumulative RPKG`           = Cumulative_RPKG,
+    `Cumulative Contribution (%)` = Cumulative_Contribution_Pct
+  ) %>%
+  mutate(
+    `Total RPKG`                = round(`Total RPKG`, 2),
+    `Contribution (%)`          = round(`Contribution (%)`, 2),
+    `Cumulative RPKG`           = round(`Cumulative RPKG`, 2),
+    `Cumulative Contribution (%)` = round(`Cumulative Contribution (%)`, 2)
+  )
+
+# Export workbook with a single clean worksheet
+wb_s8 <- createWorkbook()
+addWorksheet(wb_s8, "Table_S8_Unique_ARGs")
+writeData(wb_s8, "Table_S8_Unique_ARGs", table_s8_unique)
+saveWorkbook(wb_s8, "Table_S8_ARG_Profiles_RPKG.xlsx", overwrite = TRUE)
+
+cat("-> Table_S8_ARG_Profiles_RPKG.xlsx generated successfully with a single focused worksheet!\n")
+
+# ------------------------------------------------------------------------------
+# 8. Render/Print the table visually in the HTML report
+# ------------------------------------------------------------------------------
+kable(table_s8_unique, 
+      format = "html", 
+      caption = "Table S8. Relative contribution of the 203 unique antimicrobial resistance genes to the total resistome abundance (RPKG-normalized).") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE,
+                position = "center")
+```
+
+---
+
+### Module 10. Tripartite Procrustes and Partial Mantel Cross-Analysis (Figure 8)
+
+This section constructs **Figure 8**, performing tripartite cross-analyses among microbial community structures (at Genus and Species levels), the resistome, and environmental variables. Procrustes analysis evaluates congruence between ordinations, while partial Mantel tests isolate microbiome-resistome associations by controlling for environmental matrices (pH, temperature, and turbidity). Panels A and B are combined using `patchwork`.
+
+```{r 10-figure8-tripartite-procrustes, fig.width=16, fig.height=8, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 0. LOAD REQUIRED LIBRARIES
+# ------------------------------------------------------------------------------
+library(tidyverse)
+library(vegan)
+library(ggrepel)
+library(patchwork)
+
+# ------------------------------------------------------------------------------
+# 1. GENUS-LEVEL TRIPARTITE ANALYSIS
+# ------------------------------------------------------------------------------
+metadata_stats <- read_tsv("metadatos_saida_ultimos.txt", show_col_types = FALSE) %>% as.data.frame()
+if (!"Sample" %in% colnames(metadata_stats)) {
+  colnames(metadata_stats)[1] <- "Sample"
+}
+continuous_vars <- c("pH", "Temperature", "Turbidity")
+metadata_stats[continuous_vars] <- lapply(metadata_stats[continuous_vars], as.numeric)
+
+genus_table <- read.csv("Abundancia_Relativa_31_Genus.csv", row.names = 1, check.names = FALSE)
+res_table   <- read.csv("RPKG_Abundance_Estricto.csv", row.names = 1, check.names = FALSE)
+
+samples_genus_res <- intersect(colnames(genus_table), rownames(res_table))
+common_samples    <- sort(intersect(samples_genus_res, metadata_stats$Sample))
+
+genus_matrix <- as.matrix(t(genus_table[, common_samples]))
+res_matrix   <- as.matrix(res_table[common_samples, ])
+
+clean_meta <- metadata_stats %>%
+  filter(Sample %in% common_samples) %>%
+  arrange(Sample) %>%
+  rename(`Sample name` = Sample)
+
+dist_genus <- vegdist(genus_matrix, method = "bray")
+dist_res   <- vegdist(res_matrix, method = "bray")
+dist_env   <- vegdist(scale(clean_meta %>% select(any_of(continuous_vars))), method = "euclidean")
+
+set.seed(123)
+mantel_simple_g <- mantel(dist_genus, dist_res, method = "spearman", permutations = 9999)
+set.seed(123)
+mantel_partial_g <- mantel.partial(dist_genus, dist_res, dist_env, method = "spearman", permutations = 999)
+
+pcoa_genus <- cmdscale(dist_genus, k = 2)
+pcoa_res_g <- cmdscale(dist_res, k = 2)
+set.seed(123)
+procrustes_res_g <- protest(X = pcoa_genus, Y = pcoa_res_g, permutations = 999)
+
+set.seed(123)
+envfit_cross_g <- envfit(pcoa_genus, clean_meta %>% select(any_of(continuous_vars)), permutations = 999, na.rm = TRUE)
+df_vectors_g <- as.data.frame(envfit_cross_g$vectors$arrows) %>%
+  cbind(p_val = envfit_cross_g$vectors$pvals) %>%
+  rownames_to_column("Variable") %>% filter(p_val < 0.05)
+
+pro_data_g <- data.frame(
+  `Sample name` = rownames(genus_matrix),
+  Genus_Dim1    = procrustes_res_g$X[, 1], 
+  Genus_Dim2    = procrustes_res_g$X[, 2],
+  Res_Dim1      = procrustes_res_g$Yrot[, 1], 
+  Res_Dim2      = procrustes_res_g$Yrot[, 2],
+  check.names   = FALSE
+) %>% left_join(clean_meta, by = "Sample name")
+
+r_pro_g <- formatC(procrustes_res_g$t0, format = "f", digits = 3)
+p_pro_g <- formatC(procrustes_res_g$signif, format = "f", digits = 4)
+r_man_g <- formatC(mantel_partial_g$statistic, format = "f", digits = 3)
+p_man_g <- formatC(mantel_partial_g$signif, format = "f", digits = 4)
+
+procrustes_title_g <- bquote(
+  "Procrustes " * italic(r) * " = " * .(r_pro_g) * ", " * italic(p) * " = " * .(p_pro_g) * 
+  "  |  Partial Mantel " * italic(r) * " = " * .(r_man_g) * ", " * italic(p) * " = " * .(p_man_g)
+)
+
+scale_factor <- 0.35
+plot_genus_pro <- ggplot() +
+  geom_segment(data = pro_data_g, aes(x = Genus_Dim1, y = Genus_Dim2, xend = Res_Dim1, yend = Res_Dim2),
+               color = "gray60", linewidth = 0.5, alpha = 0.6) +
+  geom_point(data = pro_data_g, aes(x = Genus_Dim1, y = Genus_Dim2, fill = "Genus"), shape = 21, size = 3) +
+  geom_point(data = pro_data_g, aes(x = Res_Dim1, y = Res_Dim2, fill = "Resistome"), shape = 21, size = 3) +
+  scale_fill_manual(
+    values = c("Genus" = "#2166AC", "Resistome" = "#B2182B"),
+    breaks = c("Genus", "Resistome"),
+    name = "Matrix"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title  = element_text(hjust = 0.5, size = 11, face = "plain"),
+    plot.margin = margin(t = 10, r = 15, b = 10, l = 15, unit = "pt")
+  ) +
+  labs(title = procrustes_title_g, x = "Dimension 1", y = "Dimension 2")
+
+if(nrow(df_vectors_g) > 0) {
+  plot_genus_pro <- plot_genus_pro +
+    geom_segment(data = df_vectors_g, aes(x = 0, y = 0, xend = Dim1 * scale_factor, yend = Dim2 * scale_factor),
+                 arrow = arrow(length = unit(0.2, "cm")), color = "forestgreen", linewidth = 1.2) +
+    geom_text_repel(data = df_vectors_g, aes(x = Dim1 * scale_factor * 0.95, y = Dim2 * scale_factor * 0.98, label = Variable),
+                    color = "forestgreen", fontface = "bold", size = 4.0, box.padding = 0.1, point.padding = 0.1, force = 0, segment.color = NA)
+}
+
+# ------------------------------------------------------------------------------
+# 2. SPECIES-LEVEL TRIPARTITE ANALYSIS
+# ------------------------------------------------------------------------------
+species_table <- read.csv("Abundancia_Relativa_31_Species.csv", row.names = 1, check.names = FALSE)
+samples_species_res <- intersect(colnames(species_table), rownames(res_table))
+common_samples_s    <- sort(intersect(samples_species_res, metadata_stats$Sample))
+
+species_matrix <- as.matrix(t(species_table[, common_samples_s]))
+res_matrix_s   <- as.matrix(res_table[common_samples_s, ])
+
+clean_meta_s <- metadata_stats %>%
+  filter(Sample %in% common_samples_s) %>%
+  arrange(Sample) %>%
+  rename(`Sample name` = Sample)
+
+dist_species <- vegdist(species_matrix, method = "bray")
+dist_res_s   <- vegdist(res_matrix_s, method = "bray")
+dist_env_s   <- vegdist(scale(clean_meta_s %>% select(any_of(continuous_vars))), method = "euclidean")
+
+set.seed(123)
+mantel_partial_s <- mantel.partial(dist_species, dist_res_s, dist_env_s, method = "spearman", permutations = 999)
+
+pcoa_species <- cmdscale(dist_species, k = 2)
+pcoa_res_s   <- cmdscale(dist_res_s, k = 2)
+set.seed(123)
+procrustes_res_s <- protest(X = pcoa_species, Y = pcoa_res_s, permutations = 999)
+
+set.seed(123)
+envfit_cross_s <- envfit(pcoa_species, clean_meta_s %>% select(any_of(continuous_vars)), permutations = 999, na.rm = TRUE)
+df_vectors_s <- as.data.frame(envfit_cross_s$vectors$arrows) %>%
+  cbind(p_val = envfit_cross_s$vectors$pvals) %>%
+  rownames_to_column("Variable") %>% filter(p_val < 0.05)
+
+pro_data_s <- data.frame(
+  `Sample name` = rownames(species_matrix),
+  Species_Dim1  = procrustes_res_s$X[, 1], 
+  Species_Dim2  = procrustes_res_s$X[, 2],
+  Res_Dim1      = procrustes_res_s$Yrot[, 1], 
+  Res_Dim2      = procrustes_res_s$Yrot[, 2],
+  check.names   = FALSE
+) %>% left_join(clean_meta_s, by = "Sample name")
+
+r_pro_s <- formatC(procrustes_res_s$t0, format = "f", digits = 3)
+p_pro_s <- formatC(procrustes_res_s$signif, format = "f", digits = 4)
+r_man_s <- formatC(mantel_partial_s$statistic, format = "f", digits = 3)
+p_man_s <- formatC(mantel_partial_s$signif, format = "f", digits = 4)
+
+procrustes_title_s <- bquote(
+  "Procrustes " * italic(r) * " = " * .(r_pro_s) * ", " * italic(p) * " = " * .(p_pro_s) * 
+  "  |  Partial Mantel " * italic(r) * " = " * .(r_man_s) * ", " * italic(p) * " = " * .(p_man_s)
+)
+
+plot_species_pro <- ggplot() +
+  geom_segment(data = pro_data_s, aes(x = Species_Dim1, y = Species_Dim2, xend = Res_Dim1, yend = Res_Dim2),
+               color = "gray60", linewidth = 0.5, alpha = 0.6) +
+  geom_point(data = pro_data_s, aes(x = Species_Dim1, y = Species_Dim2, fill = "Species"), shape = 21, size = 3) +
+  geom_point(data = pro_data_s, aes(x = Res_Dim1, y = Res_Dim2, fill = "Resistome"), shape = 21, size = 3) +
+  scale_fill_manual(
+    values = c("Species" = "#2166AC", "Resistome" = "#B2182B"), 
+    breaks = c("Species", "Resistome"),
+    name = "Matrix"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title  = element_text(hjust = 0.5, size = 11, face = "plain"),
+    plot.margin = margin(t = 10, r = 15, b = 10, l = 15, unit = "pt")
+  ) +
+  labs(title = procrustes_title_s, x = "Dimension 1", y = "Dimension 2")
+
+if(nrow(df_vectors_s) > 0) {
+  plot_species_pro <- plot_species_pro +
+    geom_segment(data = df_vectors_s, aes(x = 0, y = 0, xend = Dim1 * scale_factor, yend = Dim2 * scale_factor),
+                 arrow = arrow(length = unit(0.2, "cm")), color = "forestgreen", linewidth = 1.2) +
+    geom_text_repel(data = df_vectors_s, aes(x = Dim1 * scale_factor * 0.95, y = Dim2 * scale_factor * 0.98, label = Variable),
+                    color = "forestgreen", fontface = "bold", size = 4.0, box.padding = 0.1, point.padding = 0.1, force = 0, segment.color = NA)
+}
+
+# ------------------------------------------------------------------------------
+# 3. COMBINE PANELS INTO FIGURE 8 AND EXPORT
+# ------------------------------------------------------------------------------
+fig8 <- (plot_genus_pro + plot_species_pro) +
+  plot_annotation(tag_levels = 'A') & 
+  theme(
+    plot.tag = element_text(size = 20, face = "bold"),
+    plot.tag.position = c(0.02, 0.92)
+  )
+
+# Display plot in document output
+print(fig8)
+
+# Export Figure 8
+svglite::svglite("Figure_8_Procrustes_Combined_AB.svg", width = 16, height = 8)
+print(fig8)
+dev.off()
+
+ggsave("Figure_8_Procrustes_Combined_AB.tiff", plot = fig8, width = 16, height = 8, dpi = 300, compression = "lzw")
+```
+
+---
+
+### Module 11. Bipartite Species–ARG Co-occurrence Network (Figure 9)
+
+This section constructs **Figure 9**, displaying a bipartite co-occurrence network between key bacterial species (ESKAPE pathogens, opportunistic taxa, native aquatic taxa, and core genera) and antimicrobial resistance genes (ARGs). Correlations are calculated using Spearman rank correlation ($|r_s| \ge 0.6$, FDR-adjusted $p < 0.05$). Nodes are color-coded by taxonomic classification and gene category, while edge thickness reflects correlation magnitude.
+
+```{r 11-figure9-bipartite-network, fig.width=13, fig.height=13, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 1. DEFINE TARGET CLINICAL & FOCAL SPECIES
+# ------------------------------------------------------------------------------
+focal_eskape_species <- c(
+  "Acinetobacter baumannii", "Enterobacter cloacae", "Enterobacter hormaechei",
+  "Klebsiella pneumoniae", "Pseudomonas aeruginosa"
+)
+
+focal_opportunistic_species <- c(
+  "Acinetobacter johnsonii", "Acinetobacter lwoffii", "Klebsiella oxytoca", "Pseudomonas putida",
+  "Aeromonas media", "Aeromonas caviae", "Aeromonas veronii", 
+  "Aliarcobacter cryaerophilus", "Aliarcobacter butzleri",
+  "Escherichia coli", "Escherichia albertii", "Escherichia fergusonii",
+  "Mycobacterium tuberculosis", "Mycobacterium intracellulare", "Mycobacterium avium"
+)
+
+focal_20_clinical <- c(focal_eskape_species, focal_opportunistic_species)
+
+native_target_genera <- c(
+  "Microcystis", "Fluviibacter", "Acidovorax", "Cyanobium", "Rheinheimera", 
+  "Thauera", "Polynucleobacter", "Synechococcus", "Streptomyces", "Flavobacterium", "Massilia"
+)
+
+core_target_genera <- c("Faucicola", "Tolumonas", "Bifidobacterium")
+
+# ------------------------------------------------------------------------------
+# 2. FILTER NATIVE/CORE SPECIES FROM MEMORY (>= 0.1%)
+# ------------------------------------------------------------------------------
+tax_species_all <- data_rel_taxa %>%
+  filter(Taxonomic_level == "Species" | Taxonomic_level == "species" | is.na(Taxonomic_level)) %>%
+  mutate(
+    Taxa               = str_trim(Taxa),
+    Sample_name        = str_trim(Sample_name),
+    Relative_abundance = as.numeric(Relative_abundance),
+    Genus              = str_extract(Taxa, "^[A-Za-z]+")
+  )
+
+abundance_cutoff <- 0.1
+
+filtered_native_species <- tax_species_all %>%
+  filter(Genus %in% native_target_genera) %>%
+  group_by(Genus, Taxa) %>%
+  summarise(Mean_Abundance = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Genus) %>%
+  slice_max(order_by = Mean_Abundance, n = 1, with_ties = FALSE) %>%
+  filter(Mean_Abundance >= abundance_cutoff) %>%
+  pull(Taxa)
+
+filtered_core_species <- tax_species_all %>%
+  filter(Genus %in% core_target_genera) %>%
+  group_by(Genus, Taxa) %>%
+  summarise(Mean_Abundance = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Genus) %>%
+  slice_max(order_by = Mean_Abundance, n = 1, with_ties = FALSE) %>%
+  filter(Mean_Abundance >= abundance_cutoff) %>%
+  pull(Taxa)
+
+target_species_list <- unique(c(focal_20_clinical, filtered_native_species, filtered_core_species))
+
+# ------------------------------------------------------------------------------
+# 3. PREPARE TAXONOMY MATRIX
+# ------------------------------------------------------------------------------
+tax_filtered <- tax_species_all %>%
+  filter(Taxa %in% target_species_list) %>%
+  mutate(
+    sample_prefix = str_extract(Sample_name, "^[A-Za-z]+"),
+    sample_num    = as.numeric(str_extract(Sample_name, "[0-9]+")),
+    sample        = paste0(sample_prefix, sample_num)
+  ) %>%
+  group_by(sample, Taxa) %>%
+  summarise(Abundance = sum(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Taxa, values_from = Abundance, values_fill = 0)
+
+# ------------------------------------------------------------------------------
+# 4. LOAD ARG DATA FROM Resistome.xlsx
+# ------------------------------------------------------------------------------
+arg_data_raw <- read.xlsx("Resistome.xlsx")
+
+arg_data <- arg_data_raw %>%
+  mutate(
+    Sample_name = str_trim(Sample_name),
+    ARG_Gene    = str_trim(gene_unif_final_manual),
+    RPKG        = as.numeric(RPKG)
+  ) %>%
+  mutate(
+    sample_prefix = str_extract(Sample_name, "^[A-Za-z]+"),
+    sample_num    = as.numeric(str_extract(Sample_name, "[0-9]+")),
+    sample        = paste0(sample_prefix, sample_num)
+  ) %>%
+  group_by(sample, ARG_Gene) %>%
+  summarise(RPKG = sum(RPKG, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = ARG_Gene, values_from = RPKG, values_fill = 0)
+
+# ------------------------------------------------------------------------------
+# 5. MERGE DATASETS BY SAMPLE & BUILD MATRICES
+# ------------------------------------------------------------------------------
+combined_data <- inner_join(tax_filtered, arg_data, by = "sample") %>%
+  column_to_rownames("sample")
+
+taxa_cols <- intersect(names(combined_data), target_species_list)
+arg_cols  <- setdiff(names(combined_data), taxa_cols)
+
+taxa_matrix <- as.matrix(combined_data[, taxa_cols])
+arg_matrix  <- as.matrix(combined_data[, arg_cols])
+
+# ------------------------------------------------------------------------------
+# 6. CALCULATE SPEARMAN CORRELATIONS & FDR ADJUSTMENT
+# ------------------------------------------------------------------------------
+cor_matrix <- matrix(0, nrow = length(taxa_cols), ncol = length(arg_cols),
+                     dimnames = list(taxa_cols, arg_cols))
+p_matrix   <- cor_matrix
+
+for (t in taxa_cols) {
+  for (a in arg_cols) {
+    test <- suppressWarnings(cor.test(taxa_matrix[, t], arg_matrix[, a], method = "spearman"))
+    cor_matrix[t, a] <- test$estimate
+    p_matrix[t, a]   <- test$p.value
+  }
+}
+
+p_fdr_vector <- p.adjust(as.vector(p_matrix), method = "BH")
+p_fdr_matrix <- matrix(p_fdr_vector, nrow = length(taxa_cols), ncol = length(arg_cols),
+                       dimnames = list(taxa_cols, arg_cols))
+
+# ------------------------------------------------------------------------------
+# 7. FILTER CORRELATIONS (|r_s| >= 0.6 & FDR p < 0.05)
+# ------------------------------------------------------------------------------
+edge_list <- expand.grid(Taxa = taxa_cols, ARG = arg_cols, stringsAsFactors = FALSE) %>%
+  mutate(
+    r_s   = apply(., 1, function(x) cor_matrix[x[1], x[2]]),
+    p_adj = apply(., 1, function(x) p_fdr_matrix[x[1], x[2]])
+  ) %>%
+  filter(abs(r_s) >= 0.6 & p_adj < 0.05) %>%
+  mutate(Direction = ifelse(r_s > 0, "Positive", "Negative"))
+
+# ------------------------------------------------------------------------------
+# 8. BUILD BIPARTITE IGRAPH OBJECT & ABBREVIATE SPECIES NAMES
+# ------------------------------------------------------------------------------
+net_graph <- graph_from_data_frame(edge_list[, c("Taxa", "ARG", "r_s", "Direction")], directed = FALSE)
+
+V(net_graph)$NodeClassification <- case_when(
+  V(net_graph)$name %in% focal_eskape_species ~ "ESKAPE pathogens",
+  V(net_graph)$name %in% focal_opportunistic_species ~ "Opportunistic pathogens",
+  str_detect(V(net_graph)$name, paste0("(?i)", paste(native_target_genera, collapse="|"))) ~ "Native aquatic taxa",
+  V(net_graph)$name %in% taxa_cols ~ "Other core taxa",
+  TRUE ~ "Resistance genes"
+)
+
+V(net_graph)$NodeType <- ifelse(V(net_graph)$name %in% taxa_cols, "Species", "ARG")
+V(net_graph)$NodeSize <- ifelse(V(net_graph)$NodeType == "ARG", 3.2, 6.0)
+
+clean_node_label_abbrev <- function(name) {
+  if (name %in% target_species_list) {
+    if (str_detect(name, "(?i)sp\\.")) {
+      return(paste0("bolditalic('", name, "')"))
+    } else {
+      abbrev_name <- str_replace(name, "^([A-Z])[a-z]+", "\\1.")
+      return(paste0("bolditalic('", abbrev_name, "')"))
+    }
+  }
+  
+  x <- name
+  x <- str_replace(x, "^Qnr", "qnr")
+  x <- str_replace(x, "^AAC", "aac")
+  x <- str_replace(x, "^APH", "aph")
+  x <- str_replace(x, "^ANT", "ant")
+  x <- str_replace(x, "^Inu", "inu")
+  x <- str_replace(x, "^Ere", "ere")
+  x <- str_replace(x, "^Rbp", "rbp")
+  x <- str_replace(x, "^Mex", "mex")
+  
+  if (str_detect(x, "^bla") && x != "blaA") {
+    enzima <- str_remove(x, "^bla")
+    return(paste0("italic(bla)[plain(\"", enzima, "\")]"))
+  } else {
+    x_safe <- str_replace_all(x, "'", "\\\\'")
+    return(paste0("italic('", x_safe, "')"))
+  }
+}
+
+V(net_graph)$parsed_label <- sapply(V(net_graph)$name, clean_node_label_abbrev)
+
+set.seed(123)
+layout_kk_clean <- create_layout(net_graph, layout = "kk")
+
+# ------------------------------------------------------------------------------
+# 8b. COORDINATE ADJUSTMENTS FOR ESCHERICHIA MICRO-ALIGNMENT
+# ------------------------------------------------------------------------------
+layout_species <- layout_kk_clean %>% filter(NodeType == "Species")
+layout_species <- layout_species %>%
+  mutate(
+    x = ifelse(name == "Escherichia albertii", x + 0.07, x),
+    y = ifelse(name == "Escherichia albertii", y - 0.02, y),
+    x = ifelse(name == "Escherichia fergusonii", x - 0.10, x),
+    y = ifelse(name == "Escherichia fergusonii", y + 0.03, y)
+  )
+
+layout_args <- layout_kk_clean %>% filter(NodeType == "ARG")
+
+# ------------------------------------------------------------------------------
+# 8c. DYNAMICALLY GENERATE KEY FOR SPECIES PRESENT IN GRAPH
+# ------------------------------------------------------------------------------
+present_species <- intersect(V(net_graph)$name, target_species_list)
+legend_species_sorted <- sort(present_species)
+
+split_idx <- ceiling(length(legend_species_sorted) / 2)
+
+col1_species <- legend_species_sorted[1:split_idx]
+col2_species <- legend_species_sorted[(split_idx + 1):length(legend_species_sorted)]
+
+format_key_entry <- function(x) {
+  if (str_detect(x, "(?i)sp\\.")) {
+    return(paste0(x, ": ", x))
+  } else {
+    return(paste0(str_replace(x, "^([A-Z])[a-z]+", "\\1."), ": ", x))
+  }
+}
+
+col1_text <- paste(sapply(col1_species, format_key_entry), collapse = "\n")
+col2_text <- paste(sapply(col2_species, format_key_entry), collapse = "\n")
+
+max_x_val <- max(layout_kk_clean$x)
+max_y_val <- max(layout_kk_clean$y)
+
+x_table_col1  <- max_x_val * 0.30
+x_table_col2  <- max_x_val * 0.70
+y_table_title <- max_y_val * 1.05
+y_table_text  <- max_y_val * 1.00
+
+# ------------------------------------------------------------------------------
+# 9. BUILD FIGURE 9 PLOT
+# ------------------------------------------------------------------------------
+fig9 <- ggraph(layout_kk_clean) +
+  geom_edge_link(aes(width = abs(r_s), color = Direction), alpha = 0.50) +
+  geom_node_point(aes(color = NodeClassification, shape = NodeClassification, size = NodeSize)) +
+  
+  geom_node_text(
+    data = layout_species,
+    aes(x = x, y = y, label = parsed_label), 
+    parse = TRUE, family = "sans", repel = TRUE, size = 2.5,
+    max.overlaps = Inf, 
+    point.padding = unit(0.15, "lines"),
+    box.padding   = unit(0.08, "lines"),
+    force         = 0.5,
+    force_pull    = 5.0,
+    max.iter      = 10000,
+    segment.color = "grey40", 
+    segment.size  = 0.25, 
+    segment.alpha = 0.6,
+    bg.color      = "white", 
+    bg.r          = 0.12
+  ) +
+  
+  geom_node_text(
+    data = layout_args,
+    aes(x = x, y = y, label = parsed_label), 
+    parse = TRUE, family = "sans", repel = TRUE, size = 2.0,
+    max.overlaps = Inf, 
+    point.padding = unit(0.10, "lines"),
+    box.padding   = unit(0.05, "lines"),
+    force         = 0.3,
+    force_pull    = 5.0,
+    max.iter      = 10000,
+    segment.color = "grey70", 
+    segment.size  = 0.20, 
+    segment.alpha = 0.5,
+    bg.color      = "white", 
+    bg.r          = 0.10
+  ) +
+  
+  annotate("text", x = x_table_col1, y = y_table_title, label = "Species Key:", fontface = "bold", family = "sans", size = 3.2, hjust = 0) +
+  annotate("text", x = x_table_col1, y = y_table_text, label = col1_text, fontface = "italic", family = "sans", size = 2.5, hjust = 0, vjust = 1.0) +
+  annotate("text", x = x_table_col2, y = y_table_text, label = col2_text, fontface = "italic", family = "sans", size = 2.5, hjust = 0, vjust = 1.0) +
+  
+  scale_size_identity() +
+  scale_color_manual(
+    name = "Node Classification:",
+    values = c(
+      "ESKAPE pathogens"        = "#ab47bc",
+      "Opportunistic pathogens" = "#ab47bc",
+      "Native aquatic taxa"     = "#1874cd",
+      "Other core taxa"         = "#ff9800",
+      "Resistance genes"        = "#666666"
+    ),
+    guide = guide_legend(order = 1, nrow = 1)
+  ) +
+  scale_shape_manual(
+    name = "Node Classification:",
+    values = c(
+      "ESKAPE pathogens"        = 17,
+      "Opportunistic pathogens" = 19,
+      "Native aquatic taxa"     = 19,
+      "Other core taxa"         = 19,
+      "Resistance genes"        = 15
+    ),
+    guide = guide_legend(order = 1, nrow = 1)
+  ) +
+  scale_edge_color_manual(
+    name = "Correlation type:",
+    values = c("Positive" = "#2ca02c", "Negative" = "#d7191c"),
+    guide = guide_legend(order = 2, nrow = 1)
+  ) +
+  scale_edge_width_continuous(
+    name = expression(Spearman ~ '|'*r[s]*'|'),
+    range = c(0.4, 2.0),
+    breaks = c(0.7, 0.8, 0.9),
+    labels = c("0.7", "0.8", "0.9"),
+    guide = guide_legend(order = 2, nrow = 1)
+  ) +
+  
+  theme_void(base_size = 12, base_family = "sans") +
+  labs(
+    subtitle = bquote(plain("Spearman correlation |") * r[s] * plain("| ") >= 0.6 * plain(", FDR ") * italic("p") ~ plain("< 0.05"))
+  ) +
+  
+  theme(
+    plot.subtitle       = element_text(family = "sans", size = 11, hjust = 0.5, color = "black", margin = margin(b = 15)),
+    legend.position     = "bottom",
+    legend.box          = "vertical",
+    legend.box.just     = "center",
+    legend.spacing.x    = unit(0.8, "cm"),
+    legend.spacing.y    = unit(0.15, "cm"),
+    legend.margin       = margin(t = 10),
+    legend.title        = element_text(family = "sans", face = "bold", size = 10.0),
+    legend.text         = element_text(family = "sans", size = 9.5),
+    plot.margin         = margin(35, 35, 35, 35)
+  )
+
+# Display plot in document output
+print(fig9)
+
+# ------------------------------------------------------------------------------
+# 10. EXPORT HIGH-RESOLUTION OUTPUT FILES
+# ------------------------------------------------------------------------------
+svglite::svglite("Figure_9_Bipartite_ARG_Network.svg", width = 13, height = 13)
+print(fig9)
+dev.off()
+
+ggsave("Figure_9_Bipartite_ARG_Network.tiff", plot = fig9, width = 13, height = 13, dpi = 300, compression = "lzw")
+```
+
+---
+
+## Supplementary Figures
+
+---
+
+### Module 12. Rarefaction Curves across States and Water Body Types (Figure S1)
+
+This section constructs **Figure S1**, displaying a two-panel grid of sequencing depth rarefaction curves facetted by geographical region (State) and water body type (Lentic vs. Lotic). Panel A depicts observed taxonomic richness at the Genus level, while Panel B evaluates richness at the Species level. Rarefaction summaries and coverage estimates are compiled into **Table S2**.
+
+```{r 12-figures1-rarefaction-curves, fig.width=12, fig.height=14, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 1. SETUP PARAMETERS & LOAD METADATA
+# ------------------------------------------------------------------------------
+metadata_rare <- read_tsv("metadatos_saida_ultimos.txt", show_col_types = FALSE) %>%
+  mutate(
+    Sample_name   = str_trim(as.character(Sample_name)),
+    State         = str_trim(as.character(State)),
+    Effluent_type = str_trim(as.character(Effluent_type))
+  )
+
+config_analisis <- list(
+  list(nivel = "Genus",   archivo = "Abundancia_Absoluta_31_Genus.csv"),
+  list(nivel = "Species", archivo = "Abundancia_Absoluta_31_Species.csv")
+)
+
+COMMON_DEPTH    <- 50000 
+FUENTE_GRAFICOS <- "sans"
+
+plots_rarefaccion <- list()
+tablas_resumen    <- list()
+
+# ------------------------------------------------------------------------------
+# 2. PROCESS RAREFACTION FOR GENUS AND SPECIES LEVELS
+# ------------------------------------------------------------------------------
+for (item in config_analisis) {
+  nivel   <- item$nivel
+  archivo <- item$archivo
+  sep_char <- if (grepl("\\.csv$", archivo)) "," else "\t"
+  
+  if (!file.exists(archivo)) {
+    warning(paste("File", archivo, "not found. Skipping..."))
+    next
+  }
+  
+  tabla_conteos    <- read.table(archivo, header = TRUE, row.names = 1, sep = sep_char, check.names = FALSE)
+  matriz_comunidad <- round(t(tabla_conteos))
+  
+  if (nrow(matriz_comunidad) == 0) next
+  
+  rarefaccion_list <- rarecurve(matriz_comunidad, step = 100, label = FALSE)
+  
+  rare_df <- purrr::imap_dfr(rarefaccion_list, function(curve, idx) {
+    data.frame(
+      Original_Sample = rownames(matriz_comunidad)[idx], 
+      Reads           = attr(curve, "Subsample"), 
+      Taxa            = as.numeric(curve)
+    )
+  }) %>%
+    mutate(
+      Sample = trimws(gsub("\\..*", "", Original_Sample)),
+      Sample_Short = ifelse(
+        grepl("^[A-Za-z]+_[0-9]+", Sample),
+        paste0(
+          sub("^([A-Za-z]+)_.*", "\\1", Sample), 
+          as.numeric(sub("^[A-Za-z]+_([0-9]+)_.*", "\\1", Sample)) 
+        ),
+        Sample 
+      )
+    ) %>%
+    left_join(metadata_rare, by = c("Sample_Short" = "Sample_name"))
+  
+  # Construct Individual Rank Plot
+  plot_rare <- ggplot(rare_df, aes(x = Reads, y = Taxa, group = Sample_Short, color = Sample_Short)) +
+    geom_line(linewidth = 0.6, alpha = 0.85) +
+    facet_wrap(~ State + Effluent_type, scales = "free_x", ncol = 4) + 
+    labs(
+      title = paste("Rarefaction Curves -", nivel, "Level"), 
+      x     = "Sequencing Depth (Reads)", 
+      y     = paste0("Observed Taxa (", nivel, ")"),
+      color = "Sample name"
+    ) +
+    theme_bw(base_size = 9, base_family = FUENTE_GRAFICOS) + 
+    theme(
+      legend.position  = "bottom",
+      legend.key.size  = unit(0.3, "cm"),          
+      legend.text      = element_text(size = 7, family = FUENTE_GRAFICOS),      
+      legend.title     = element_text(size = 8, face = "bold", family = FUENTE_GRAFICOS),
+      plot.title       = element_text(size = 11, face = "bold", hjust = 0.5, family = FUENTE_GRAFICOS),
+      axis.title       = element_text(size = 9, face = "bold", family = FUENTE_GRAFICOS),
+      axis.text.y      = element_text(size = 6.5, color = "black", family = FUENTE_GRAFICOS),
+      axis.text.x      = element_text(size = 6.5, color = "black", family = FUENTE_GRAFICOS, angle = 30, hjust = 1),
+      strip.background = element_rect(fill = "#f4ebd8", color = "#333333"),
+      strip.text       = element_text(face = "bold", size = 8.5, family = FUENTE_GRAFICOS),
+      panel.grid.minor = element_blank()
+    ) +
+    guides(color = guide_legend(ncol = 10))
+  
+  plots_rarefaccion[[nivel]] <- plot_rare
+  
+  # Summary Table Data Generation
+  tabla_resumen <- rare_df %>%
+    group_by(Sample_Short, State, Effluent_type) %>%
+    filter(Reads <= max(Reads)) %>% 
+    summarise(
+      Max_Reads         = max(Reads),
+      Observed_Taxa_Max = max(Taxa),
+      Taxa_at_50k       = if (max(Reads) >= COMMON_DEPTH) approx(Reads, Taxa, xout = COMMON_DEPTH)$y else NA,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Taxonomic_Level = nivel,
+      Taxa_at_50k     = round(Taxa_at_50k, 0)
+    )
+  
+  tablas_resumen[[nivel]] <- tabla_resumen
+}
+
+# ------------------------------------------------------------------------------
+# 3. COMBINE PANELS INTO FIGURE S1 AND EXPORT TABLE S2 (SIDE-BY-SIDE FORMAT)
+# ------------------------------------------------------------------------------
+fig_s1 <- (plots_rarefaccion[["Genus"]] / plots_rarefaccion[["Species"]]) + 
+  plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(face = "bold", size = 14))
+
+# Display plot in document output
+print(fig_s1)
+
+# Export Figure S1
+svglite::svglite("Figure_S1_Rarefaction_Curves.svg", width = 12.0, height = 14.0)
+print(fig_s1)
+dev.off()
+
+ggsave("Figure_S1_Rarefaction_Curves.tiff", plot = fig_s1, width = 12.0, height = 14.0, dpi = 300, compression = "lzw")
+
+# ------------------------------------------------------------------------------
+# 4. RESHAPE AND EXPORT TABLE S2 (HORIZONTAL LAYOUT)
+# ------------------------------------------------------------------------------
+table_s2_long <- bind_rows(tablas_resumen)
+
+table_s2_wide <- table_s2_long %>%
+  pivot_wider(
+    names_from = Taxonomic_Level,
+    values_from = c(Max_Reads, Observed_Taxa_Max, Taxa_at_50k),
+    names_glue = "{.value}_{Taxonomic_Level}"
+  ) %>%
+  select(
+    Sample = Sample_Short,
+    State,
+    Effluent_type,
+    Max_Reads_Genus,
+    Observed_Taxa_Max_Genus,
+    Taxa_at_50k_Genus,
+    Max_Reads_Species,
+    Observed_Taxa_Max_Species,
+    Taxa_at_50k_Species
+  ) %>%
+  arrange(Sample)
+
+# Create structured Excel file
+wb_s2 <- createWorkbook()
+addWorksheet(wb_s2, "Table_S2_Rarefaction")
+
+# Row 1: Table title
+title_s2 <- "Table S2. Rarefaction summary results used to assess sequencing depth adequacy"
+writeData(wb_s2, "Table_S2_Rarefaction", data.frame(Title = title_s2), startCol = 1, startRow = 1, colNames = FALSE)
+
+# Row 3 onward: data in wide format
+writeData(wb_s2, "Table_S2_Rarefaction", table_s2_wide, startCol = 1, startRow = 3, colNames = TRUE)
+
+# Save final files
+saveWorkbook(wb_s2, "Table_S2_Rarefaction_Summary.xlsx", overwrite = TRUE)
+write.csv(table_s2_wide, "Table_S2_Rarefaction_Summary.csv", row.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# 5. Render/Print the table visually in the HTML report
+# ------------------------------------------------------------------------------
+kable(table_s2_wide, 
+      format = "html", 
+      caption = "Table S2. Rarefaction summary results at the genus- and species-level used to assess sequencing depth adequacy.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE,
+                position = "center")
+```
+
+---
+
+### Module 13. Global Relative Abundance Profiles Across Taxonomic Ranks (Figure S2)
+
+This section constructs **Figure S2**, displaying a $2 \times 3$ grid panel of bar plots summarizing the mean relative abundance (%) of the Top 20 most abundant bacterial taxa across six major taxonomic levels (Phylum, Class, Order, Family, Genus, and Species). Taxonomic names at the Genus and Species levels are formatted in italics.
+
+```{r 13-figures2-taxonomic-ranks-grid, fig.width=14, fig.height=9, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 1. CLEAN DATASET & RE-NORMALIZE RELATIVE ABUNDANCE
+# ------------------------------------------------------------------------------
+data_rel_clean_s2 <- data_rel_taxa %>%
+  filter(!Taxa %in% non_bacterial_taxa) %>%
+  group_by(Sample_name, Taxonomic_level) %>%
+  mutate(Relative_abundance = (Relative_abundance / sum(Relative_abundance, na.rm = TRUE)) * 100) %>%
+  ungroup()
+
+# ------------------------------------------------------------------------------
+# 2. FUNCTION TO CREATE INDIVIDUAL RANK PANELS
+# ------------------------------------------------------------------------------
+create_rank_plot <- function(data, rank_name, bar_color, top_n = 20, is_italic = FALSE) {
+  
+  rank_summary <- data %>%
+    filter(Taxonomic_level == rank_name) %>%
+    group_by(Taxa) %>%
+    summarise(Mean_Abundance = mean(Relative_abundance, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(Mean_Abundance)) %>%
+    slice_head(n = top_n)
+  
+  y_text_face <- if (is_italic) "italic" else "plain"
+  
+  p <- ggplot(rank_summary, aes(x = reorder(Taxa, Mean_Abundance), y = Mean_Abundance)) +
+    geom_bar(stat = "identity", fill = bar_color, width = 0.7) +
+    coord_flip() +
+    theme_minimal(base_size = 11) +
+    labs(
+      title = rank_name,
+      x     = NULL,
+      y     = NULL
+    ) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.y      = element_text(color = "black", size = 9, face = y_text_face),
+      axis.text.x      = element_text(color = "black", size = 8),
+      plot.title       = element_text(face = "bold", hjust = 0.5, size = 12)
+    )
+  
+  return(p)
+}
+
+# ------------------------------------------------------------------------------
+# 3. GENERATE THE 6 INDIVIDUAL PANELS
+# ------------------------------------------------------------------------------
+p_phylum  <- create_rank_plot(data_rel_clean_s2, "Phylum",  "#ff6b6b", is_italic = FALSE)
+p_class   <- create_rank_plot(data_rel_clean_s2, "Class",   "#baba00", is_italic = FALSE)
+p_order   <- create_rank_plot(data_rel_clean_s2, "Order",   "#00c032", is_italic = FALSE)
+p_family  <- create_rank_plot(data_rel_clean_s2, "Family",  "#00c4c4", is_italic = FALSE)
+p_genus   <- create_rank_plot(data_rel_clean_s2, "Genus",   "#4589ff", is_italic = TRUE)
+p_species <- create_rank_plot(data_rel_clean_s2, "Species", "#f043e0", is_italic = TRUE)
+
+# ------------------------------------------------------------------------------
+# 4. COMBINE INTO A 2x3 GRID USING PATCHWORK
+# ------------------------------------------------------------------------------
+combined_plot_s2 <- (p_phylum | p_class | p_order) / 
+  (p_family | p_genus | p_species) +
+  plot_annotation(
+    caption = "Mean relative abundance (%)",
+    theme   = theme(plot.caption = element_text(hjust = 0.5, size = 12, face = "bold"))
+  )
+
+# Display plot in document output
+print(combined_plot_s2)
+
+# ------------------------------------------------------------------------------
+# 5. EXPORT HIGH-RESOLUTION OUTPUT FILES (FIGURE S2)
+# ------------------------------------------------------------------------------
+svglite::svglite("Figure_S2_Taxonomic_Relative_Abundance_Grid.svg", width = 14, height = 9)
+print(combined_plot_s2)
+dev.off()
+
+ggsave("Figure_S2_Taxonomic_Relative_Abundance_Grid.pdf", plot = combined_plot_s2, width = 14, height = 9, dpi = 300)
+ggsave("Figure_S2_Taxonomic_Relative_Abundance_Grid.tiff", plot = combined_plot_s2, width = 14, height = 9, dpi = 300, compression = "lzw")
+```
+
+---
+
+### Module 14. Alpha Diversity Comparison by Region and Water Body Type (Figure S3)
+
+This section constructs **Figure S3**, displaying a 4-panel grid of alpha diversity distributions (Shannon index and Observed Taxa richness) across geographical regions (State) and water body types (Lentic vs. Lotic) at both Genus and Species levels. Statistical differences are evaluated using Kruskal-Wallis tests with Benjamini-Hochberg (BH) adjusted pairwise Wilcoxon post-hoc comparisons. Full statistical metrics are compiled into **Table S4**.
+
+```{r 14-figures3-alpha-diversity, fig.width=12, fig.height=10, cache=TRUE}
+# ------------------------------------------------------------------------------
+# 1. SETUP PARAMETERS & METADATA STANDARDIZATION
+# ------------------------------------------------------------------------------
+metadata_alpha <- read_tsv("metadatos_saida_ultimos.txt", show_col_types = FALSE) %>%
+  mutate(
+    Sample_name   = str_trim(as.character(if ("Sample_name" %in% names(.)) Sample_name else Sample)),
+    State         = str_trim(as.character(State)),
+    Effluent_type = str_trim(as.character(if ("Effluent_type" %in% names(.)) Effluent_type else `Water body type`))
+  )
+
+metadata_alpha$State         <- factor(metadata_alpha$State, levels = c("Mexico City", "Morelos", "State of Mexico", "Tlaxcala"))
+metadata_alpha$Effluent_type <- factor(metadata_alpha$Effluent_type, levels = c("Lentic", "Lotic"))
+
+palette_state <- c("Mexico City" = "#8BCEBA", "Morelos" = "#A5B6D9", "State of Mexico" = "#EFC24A", "Tlaxcala" = "#9D559E")
+palette_water <- c("Lentic" = "#E8685D", "Lotic" = "#86C186")
+
+config_alpha <- list(
+  list(nivel = "Genus",   archivo = "Abundancia_Absoluta_31_Genus.csv"),
+  list(nivel = "Species", archivo = "Abundancia_Absoluta_31_Species.csv")
+)
+
+list_plots_alpha   <- list()
+alpha_stats_master <- data.frame()
+alpha_values_master <- data.frame()
+
+# ------------------------------------------------------------------------------
+# 2. CALCULATE ALPHA DIVERSITY AND RUN STATISTICAL TESTS
+# ------------------------------------------------------------------------------
+for (item in config_alpha) {
+  nivel   <- item$nivel
+  archivo <- item$archivo
+  sep_char <- if (grepl("\\.csv$", archivo)) "," else "\t"
+  
+  if (!file.exists(archivo)) {
+    warning(paste("File", archivo, "not found. Skipping..."))
+    next
+  }
+  
+  tabla_conteos    <- read.table(archivo, header = TRUE, row.names = 1, sep = sep_char, check.names = FALSE)
+  matriz_comunidad <- t(tabla_conteos)
+  
+  df_alpha <- data.frame(
+    Sample_name = rownames(matriz_comunidad),
+    Shannon     = vegan::diversity(matriz_comunidad, index = "shannon"),
+    Observed    = vegan::specnumber(matriz_comunidad)
+  ) %>%
+    left_join(metadata_alpha, by = c("Sample_name" = "Sample_name")) %>%
+    filter(!is.na(State) & !is.na(Effluent_type))
+  
+  # Accumulate values for output tables
+  df_values <- df_alpha %>%
+    select(Sample_name, State, Effluent_type, Shannon, Observed) %>%
+    mutate(Taxonomic_Level = nivel)
+  
+  alpha_values_master <- bind_rows(alpha_values_master, df_values)
+  
+  # Run tests and generate panels
+  for (var_name in c("State", "Effluent_type")) {
+    current_palette <- if (var_name == "State") palette_state else palette_water
+    var_label       <- if (var_name == "State") "State" else "Water Body Type"
+    
+    # We use Shannon index for primary panel plotting
+    kw_res <- kruskal.test(as.formula(paste("Shannon ~", var_name)), data = df_alpha)
+    
+    # Store stats
+    stats_row <- data.frame(
+      Taxonomic_Level = nivel,
+      Variable        = var_label,
+      Metric          = "Shannon",
+      KW_p_value      = kw_res$p.value
+    )
+    alpha_stats_master <- bind_rows(alpha_stats_master, stats_row)
+    
+    p_val_label <- if (kw_res$p.value < 0.001) "p < 0.001" else paste0("p = ", round(kw_res$p.value, 4))
+    
+    p_box <- ggplot(df_alpha, aes(x = .data[[var_name]], y = Shannon, fill = .data[[var_name]])) +
+      geom_boxplot(alpha = 0.7, outlier.shape = NA, color = "#333333", linewidth = 0.5) +
+      geom_jitter(width = 0.18, size = 2.3, alpha = 0.85, shape = 21, color = "black") +
+      scale_fill_manual(values = current_palette) +
+      labs(
+        title    = paste0(var_label, " (", nivel, " Level)"),
+        subtitle = paste0("Kruskal-Wallis: ", p_val_label),
+        x        = NULL,
+        y        = "Shannon Diversity Index"
+      ) +
+      theme_bw(base_size = 10, base_family = "sans") +
+      theme(
+        legend.position  = "none",
+        plot.title       = element_text(face = "bold", size = 11, hjust = 0.5),
+        plot.subtitle    = element_text(face = "italic", size = 9, hjust = 0.5, color = "grey30"),
+        axis.title       = element_text(face = "bold", size = 9.5),
+        axis.text.x      = element_text(face = "bold", color = "black", size = 8.5),
+        axis.text.y      = element_text(color = "black", size = 8.5),
+        panel.grid.minor = element_blank()
+      )
+    
+    list_plots_alpha[[paste(nivel, var_name, sep = "_")]] <- p_box
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 3. COMBINE PANELS INTO FIGURE S3 AND EXPORT TABLE S4
+# ------------------------------------------------------------------------------
+fig_s3 <- (list_plots_alpha[["Genus_State"]] | list_plots_alpha[["Genus_Effluent_type"]]) /
+          (list_plots_alpha[["Species_State"]] | list_plots_alpha[["Species_Effluent_type"]]) +
+  plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(face = "bold", size = 13))
+
+# Display plot in document output
+print(fig_s3)
+
+# Export Figure S3
+svglite::svglite("Figure_S3_Alpha_Diversity.svg", width = 12.0, height = 10.0)
+print(fig_s3)
+dev.off()
+
+ggsave("Figure_S3_Alpha_Diversity.tiff", plot = fig_s3, width = 12.0, height = 10.0, dpi = 300, compression = "lzw")
+
+# Export Summary Tables (Table S4)
+writexl::write_xlsx(alpha_stats_master, "Table_S4_Alpha_Diversity_Statistics.xlsx")
+
+
+# ------------------------------------------------------------------------------
+# 4. Render/Print the table visually in the HTML report
+# ------------------------------------------------------------------------------
+kable(alpha_stats_master, 
+      format = "html", 
+      caption = "Table S4.  Results of Krukal-Wallis tests comparing bacterial alpha diversity by region and water body type at the genus- and species-level .") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE,
+                position = "center")
+
+```
+
+---
+
+## List of Supplementary Tables
+
+The following supplementary tables were generated as part of this reproducible analysis workflow. Tables S1, S3, and S5 are available as independent Excel workbooks in the repository output, while Tables S2, S4, and S6-S8 are rendered visually within the corresponding sections of this report.
+
+| Table Identifier | Description / Content Summary | Status in Report | Associated Output File |
+| :--- | :--- | :--- | :--- |
+| **Table S1** | NCBI accessions, metadata, sequence quality attributes and assembly quality metrics of the study surface waters metagenomes | Exported (Data file) | `Table_S1.xlsx` |
+| **Table S2** | Rarefaction summary results at the genus- and species-level used to assess sequencing depth adequacy | Exported (Data file) | `Table_S2.xlsx` |
+| **Table S3** | Merged, deduplicated, and manually curated antimicrobial resistance gene profile. Raw counts were normalized as reads per kilobase per gigabase (RPKG, colum X) | Exported (Data file) | `Table_S3.xlsx` |
+| **Table S4** | Results of Krukal-Wallis tests comparing bacterial alpha diversity by region and water body type at the genus- and species-level | Exported (Data file) | `Table_S4.xlsx` |
+| **Table S5** | Relative abundance of the microbial community in surface water metagenomes per taxonomic level. Note that some residual non-bacterial taxa remained after host DNA filtration and were excluded in R (please, refer to the R code available in GitHub) | Exported (Data file) | `Table_S5.xlsx` |
+| **Table S6** | Non-parametric Kruskal-Wallis tests of the top 20 most abundant genera across states and water body types. Wilcoxon rank-sum tests are also reported for pairwise comparisons among states and water body types | Rendered & Exported | `Table_S6.xlsx` |
+| **Table S7** | Species-level profiling (mean relative abundance and detection frequency) targeting ESKAPE-associated genera and other priority clinical pathogens | Rendered & Exported | `Table_S7.xlsx` |
+| **Table S8** | Relative contribution of the 203 unique antimicrobial resistance genes to the total resistome abundance (RPKG-normalized) | Rendered & Exported | `Table_S8.xlsx` |
+
+> **Note for Reviewers:** The raw datasets (`Taxonomy.xlsx`, `Resistome.xlsx`, `Table_S5.xlsx`), metadata and sequence and assembly quality attributes (`Table_S1.xlsx`), and output Excel files are permanently stored in the project's GitHub repository for complete methodological transparency and independent auditing.
